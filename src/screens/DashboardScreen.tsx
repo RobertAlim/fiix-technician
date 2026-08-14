@@ -1,0 +1,826 @@
+// src/screens/DashboardScreen.tsx
+//
+// Mirrors components/TimeInScreen.tsx (AttendanceGate) + the dashboard's
+// itinerary display. Fails CLOSED on a network error — this gate exists
+// specifically for a server-verified geofence check.
+//
+// LOCATION FIX ROBUSTNESS: the first version of this screen relied only
+// on watchPositionAsync's first callback to populate the distance
+// reading, with no timeout and no distinction between "still waiting for
+// a fix" and "permission denied" / "no GPS provider available" — so it
+// could show "Checking your location…" forever with no feedback if a fix
+// never arrived. This is exactly what happens on an Android EMULATOR with
+// no mock location configured: emulators have no real GPS hardware, and
+// Location APIs simply never resolve without one manually set via
+// Android Studio's Extended Controls -> Location (or `adb emu geo fix
+// <lon> <lat>`). That's a device/emulator setup issue, not an app bug —
+// but the app should surface a clear timeout/error instead of hanging
+// silently regardless of the cause, which is what this version does.
+import React, { useEffect, useRef, useState } from "react";
+import { View, Text, Pressable, StyleSheet, FlatList, ActivityIndicator, Alert, ScrollView, Linking, Modal } from "react-native";
+import * as Location from "expo-location";
+import { Feather } from "@expo/vector-icons";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useNavigation } from "@react-navigation/native";
+import { NativeStackNavigationProp } from "@react-navigation/native-stack";
+import { useApi } from "@/hooks/useApi";
+import { useOfflineSync } from "@/hooks/useOfflineSync";
+import { distanceMeters } from "@/lib/geo";
+import { useAppTheme } from "@/theme";
+import { Palette } from "@/theme/palettes";
+import { RootStackParamList } from "@/navigation/RootNavigator";
+import {
+  requestLocationPermissions,
+  startBackgroundGpsReporting,
+  stopBackgroundGpsReporting,
+} from "@/lib/background-location";
+
+interface ItineraryStop {
+  id: number;
+  client: string;
+  location: string;
+  sequence: number | null;
+  notes: string | null;
+  // Added by the corresponding backend change (app/api/attendance/status/
+  // route.ts) specifically for the pre-Time-In itinerary preview's Google
+  // Maps icon. Null when a location has no geofence configured yet — the
+  // client hides the map affordance in that case rather than linking to
+  // (0, 0) or guessing.
+  latitude: number | null;
+  longitude: number | null;
+}
+
+interface AttendanceStatus {
+  session: { id: number; timeIn: string; timeOut: string | null } | null;
+  itinerary: ItineraryStop[];
+  firstStop: ItineraryStop | null;
+  geofence: { latitude: number; longitude: number; radiusMeters: number } | null;
+  tomorrowItinerary: ItineraryStop[];
+}
+
+interface UserStatus {
+  id: number;
+}
+
+// GET /api/schedule?technicianId=&scheduledAt= (no pageSource -> the
+// Dashboard-consumer branch, open to Technician) — matches the actual
+// server response shape checked directly against app/api/schedule/
+// route.ts, not the differently-shaped `pageSource` (Schedule page)
+// branch. This is the real per-PRINTER breakdown: one schedule (one
+// client+location stop) can contain several scheduleDetails, each a
+// separate printer needing its own maintenance report — a flat
+// itinerary list can't represent that, which is why this replaces
+// AttendanceStatus.itinerary for the on-duty view specifically (the
+// tappable one). tomorrowItinerary's simple preview is left as-is since
+// it's not actionable.
+interface SchedulePrinter {
+  id: number;
+  serialNo: string;
+  model: { name: string | null };
+  department: { name: string | null };
+}
+interface ScheduleDetailRow {
+  id: number;
+  scheduleId: number;
+  printerId: number;
+  originMTId: number | null;
+  isMaintained: boolean;
+  maintainedDate: string | null;
+  printer: SchedulePrinter;
+  maintainRecord: { id: number; notes: string | null; signPath: string | null; status: { name: string | null } } | null;
+}
+interface ScheduleRow {
+  id: number;
+  clientId: number;
+  locationId: number;
+  notes: string | null;
+  client: { name: string };
+  location: { name: string };
+  scheduleDetails: ScheduleDetailRow[];
+}
+
+/** "yyyy-MM-dd" in Asia/Manila regardless of the device's own timezone —
+ *  the server compares scheduledAt by exact string equality, so this has
+ *  to match how the backend anchors "today" (Asia/Manila), not whatever
+ *  timezone the phone happens to be set to. */
+function todayInManila(): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Manila" }).format(new Date());
+}
+
+// Distinguishes a background-permission denial (which shows its own
+// Settings/Cancel dialog, handled inline in timeInMutation below) from
+// every other Time In failure, so the generic onError alert doesn't fire
+// a second, redundant dialog on top of it.
+class BackgroundLocationRequiredError extends Error {}
+
+// How long to wait for a first location fix before showing an explicit
+// error instead of "Checking your location…" indefinitely.
+const LOCATION_FIX_TIMEOUT_MS = 12_000;
+
+type LocationState =
+  | { kind: "checking" }
+  | { kind: "ok"; distance: number }
+  | { kind: "permission-denied" }
+  | { kind: "timeout" };
+
+export function DashboardScreen() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  const { theme } = useAppTheme();
+  const styles = createStyles(theme);
+  const { syncing } = useOfflineSync();
+  const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
+  const [gpsBackgroundActive, setGpsBackgroundActive] = useState(false);
+  const [locationState, setLocationState] = useState<LocationState>({ kind: "checking" });
+  const [showLocationDisclosure, setShowLocationDisclosure] = useState(false);
+  const watchSubRef = useRef<Location.LocationSubscription | null>(null);
+
+  const statusQuery = useQuery({
+    queryKey: ["attendance-status"],
+    queryFn: () => api.get<AttendanceStatus>("/api/attendance/status"),
+    refetchInterval: 60_000,
+  });
+
+  const userStatusQuery = useQuery({
+    queryKey: ["user-status"],
+    queryFn: () => api.get<UserStatus>("/api/user-status"),
+  });
+
+  const onDuty = !!statusQuery.data?.session && !statusQuery.data.session.timeOut;
+
+  // Today's itinerary, per-printer — only fetched once on duty (before
+  // Time In there's nothing to tap into yet; the pre-Time-In view only
+  // needs the single firstStop from attendance-status above).
+  const technicianId = userStatusQuery.data?.id;
+  const scheduleQuery = useQuery({
+    queryKey: ["schedule", technicianId, "today"],
+    queryFn: () =>
+      api.get<ScheduleRow[]>(`/api/schedule?technicianId=${technicianId}&scheduledAt=${todayInManila()}`),
+    enabled: onDuty && technicianId != null,
+  });
+
+  const openMaintenance = (detail: ScheduleDetailRow) => {
+    if (detail.isMaintained) {
+      Alert.alert("Already completed", "This printer's maintenance for today is already recorded.");
+      return;
+    }
+    navigation.navigate("MaintenanceForm", {
+      serialNo: detail.printer.serialNo,
+      schedDetailsId: detail.id,
+      originMTId: detail.originMTId ?? undefined,
+    });
+  };
+
+  // Turn-by-turn directions with an explicit origin, not just a dropped
+  // pin — "navigate to" and "starting from the technician's current
+  // position" were both explicit in the request. Google's
+  // `/maps/dir/?api=1&origin=...&destination=...&travelmode=driving`
+  // form is what actually renders a real route between two points (the
+  // plain `/maps?q=` form used elsewhere in the web app, e.g.
+  // components/columns/maintenance-history/columns.tsx, only drops a
+  // single pin, no route). This is a universal google.com URL, not an
+  // app-specific deep link scheme, so it opens the Google Maps app if
+  // installed or falls back to a browser automatically on both platforms.
+  //
+  // Origin is resolved fresh at tap time (not reused from the live
+  // distance-check state elsewhere on this screen, which only tracks the
+  // FIRST stop's geofence) — this can be called for ANY stop in the
+  // itinerary, so it needs its own current-position fetch regardless of
+  // which stop is being navigated to. Falls back to an origin-less link
+  // (Maps still infers current location itself in that case) if
+  // permission is denied or a fix can't be obtained — degraded, not
+  // blocked entirely.
+  const [resolvingNavId, setResolvingNavId] = useState<number | null>(null);
+
+  const openInGoogleMaps = async (stopId: number, destLatitude: number, destLongitude: number) => {
+    setResolvingNavId(stopId);
+    try {
+      let originParam = "";
+      const perm = await Location.requestForegroundPermissionsAsync();
+      if (perm.status === "granted") {
+        try {
+          const fix = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+          originParam = `&origin=${fix.coords.latitude},${fix.coords.longitude}`;
+        } catch {
+          // No fix available (GPS off, emulator with no mock location,
+          // etc.) — proceed without an explicit origin rather than
+          // blocking navigation entirely over it.
+        }
+      }
+      const url = `https://www.google.com/maps/dir/?api=1${originParam}&destination=${destLatitude},${destLongitude}&travelmode=driving`;
+      await Linking.openURL(url);
+    } catch {
+      Alert.alert("Couldn't open Maps", "No app was available to handle the navigation link.");
+    } finally {
+      setResolvingNavId(null);
+    }
+  };
+
+  const geofence = statusQuery.data?.geofence ?? null;
+
+  useEffect(() => {
+    let cancelled = false;
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
+    async function start() {
+      if (onDuty || !geofence) return;
+      setLocationState({ kind: "checking" });
+
+      const perm = await Location.requestForegroundPermissionsAsync();
+      if (cancelled) return;
+      if (perm.status !== "granted") {
+        setLocationState({ kind: "permission-denied" });
+        return;
+      }
+
+      // Timeout guard: if neither the one-shot fix below nor the watch's
+      // first callback lands within this window, tell the technician
+      // plainly instead of leaving "Checking…" up forever.
+      timeoutHandle = setTimeout(() => {
+        if (!cancelled) setLocationState((prev) => (prev.kind === "checking" ? { kind: "timeout" } : prev));
+      }, LOCATION_FIX_TIMEOUT_MS);
+
+      const applyFix = (lat: number, lon: number) => {
+        if (cancelled) return;
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        setLocationState({ kind: "ok", distance: distanceMeters(lat, lon, geofence.latitude, geofence.longitude) });
+      };
+
+      // Try an immediate one-shot fix first — often resolves faster than
+      // waiting on watchPositionAsync's first tick, and gives a result
+      // even on devices where the watch is slow to start.
+      try {
+        const fix = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        applyFix(fix.coords.latitude, fix.coords.longitude);
+      } catch {
+        // Fall through — the watch below is the real ongoing source; a
+        // failed one-shot isn't fatal on its own.
+      }
+
+      watchSubRef.current = await Location.watchPositionAsync(
+        { accuracy: Location.Accuracy.Balanced, timeInterval: 4000, distanceInterval: 5 },
+        (fix) => applyFix(fix.coords.latitude, fix.coords.longitude)
+      );
+    }
+
+    start();
+    return () => {
+      cancelled = true;
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      watchSubRef.current?.remove();
+      watchSubRef.current = null;
+    };
+  }, [onDuty, geofence?.latitude, geofence?.longitude]);
+
+  useEffect(() => {
+    if (onDuty && !gpsBackgroundActive) {
+      startBackgroundGpsReporting().then(() => setGpsBackgroundActive(true));
+    } else if (!onDuty && gpsBackgroundActive) {
+      stopBackgroundGpsReporting().then(() => setGpsBackgroundActive(false));
+    }
+  }, [onDuty, gpsBackgroundActive]);
+
+  const withinRange =
+    geofence != null && locationState.kind === "ok" && locationState.distance <= geofence.radiusMeters;
+
+  const timeInMutation = useMutation({
+    mutationFn: async () => {
+      // Foreground first, then background — same requestLocationPermissions()
+      // helper as before (src/lib/background-location.ts), unchanged: it
+      // already requests in that order and only asks for background once
+      // foreground succeeds.
+      const perms = await requestLocationPermissions();
+      if (!perms.granted) {
+        throw new Error("Location permission is required to time in.");
+      }
+      if (!perms.backgroundGranted) {
+        // Stops the Time In process entirely — this await never resolves
+        // (only rejects), so neither the GPS fix below nor the
+        // /api/attendance/time-in POST ever runs. Settings deep-link uses
+        // Linking.openSettings() (no extra dependency: this is a real
+        // React Native API, not Expo-specific) so the technician can
+        // grant "Allow all the time" without hunting through Settings
+        // manually, then retry Time In from scratch.
+        await new Promise<void>((_, reject) => {
+          Alert.alert(
+            "Background Location Required",
+            'Fiix needs background location while you are clocked in so dispatch can see your position when the app is minimized or your phone is locked.\n\nPlease enable "Allow all the time" in Settings.',
+            [
+              {
+                text: "Cancel",
+                style: "cancel",
+                onPress: () =>
+                  reject(
+                    new BackgroundLocationRequiredError(
+                      "Background location permission is required to time in."
+                    )
+                  ),
+              },
+              {
+                text: "Open Settings",
+                onPress: () => {
+                  Linking.openSettings();
+                  reject(
+                    new BackgroundLocationRequiredError(
+                      "Background location permission is required to time in."
+                    )
+                  );
+                },
+              },
+            ],
+            { cancelable: false }
+          );
+        });
+      }
+      const fix = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+      return api.post("/api/attendance/time-in", {
+        latitude: fix.coords.latitude,
+        longitude: fix.coords.longitude,
+      });
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["attendance-status"] }),
+    onError: (err) => {
+      // The background-permission case already showed its own
+      // Settings/Cancel dialog above — showing this generic one too would
+      // just be a second, redundant popup for the same event.
+      if (err instanceof BackgroundLocationRequiredError) return;
+      Alert.alert("Time In failed", err instanceof Error ? err.message : String(err));
+    },
+  });
+
+  const timeOutMutation = useMutation({
+    // POST /api/attendance/time-out (app/api/attendance/time-out/route.ts)
+    // takes no body at all — it reads location from the technicianGpsStatus
+    // table (whatever this technician's most recent background ping left
+    // there), not from the Time Out request itself. An earlier version of
+    // this mutation fetched a fresh GPS fix and sent it anyway, which the
+    // route silently ignored — harmless, but a wasted location request
+    // that could only add latency or fail for no benefit. Removed rather
+    // than kept "just in case"; the SMS notification this triggers
+    // server-side already works correctly without it.
+    mutationFn: () => api.post("/api/attendance/time-out"),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["attendance-status"] }),
+    onError: (err) => Alert.alert("Time Out failed", err instanceof Error ? err.message : String(err)),
+  });
+
+  if (statusQuery.isLoading) {
+    return (
+      <View style={styles.centered}>
+        <ActivityIndicator size="large" color={theme.primary} />
+      </View>
+    );
+  }
+
+  if (statusQuery.isError) {
+    return (
+      <View style={styles.centered}>
+        <Text style={styles.error}>Couldn't reach the server. Check your connection.</Text>
+        <Pressable style={styles.secondaryButton} onPress={() => statusQuery.refetch()}>
+          <Text style={styles.secondaryButtonText}>Retry</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  const data = statusQuery.data!;
+
+  const renderRangePill = () => {
+    if (locationState.kind === "permission-denied") {
+      return (
+        <View style={[styles.rangePill, styles.rangePillOut]}>
+          <Feather name="alert-triangle" size={13} color={theme.warning} />
+          <Text style={[styles.rangePillText, { color: theme.warning }]}>
+            Location permission denied — enable it in Settings
+          </Text>
+        </View>
+      );
+    }
+    if (locationState.kind === "timeout") {
+      return (
+        <View style={[styles.rangePill, styles.rangePillOut]}>
+          <Feather name="alert-triangle" size={13} color={theme.warning} />
+          <Text style={[styles.rangePillText, { color: theme.warning }]}>
+            Couldn't get a GPS fix. On an emulator, set a mock location in Extended Controls.
+          </Text>
+        </View>
+      );
+    }
+    if (locationState.kind === "checking") {
+      return (
+        <View style={[styles.rangePill, styles.rangePillOut]}>
+          <Feather name="navigation" size={13} color={theme.warning} />
+          <Text style={[styles.rangePillText, { color: theme.warning }]}>Checking your location…</Text>
+        </View>
+      );
+    }
+    return (
+      <View style={[styles.rangePill, withinRange ? styles.rangePillOk : styles.rangePillOut]}>
+        <Feather
+          name={withinRange ? "check-circle" : "navigation"}
+          size={13}
+          color={withinRange ? theme.primary : theme.warning}
+        />
+        <Text style={[styles.rangePillText, { color: withinRange ? theme.primary : theme.warning }]}>
+          {withinRange
+            ? "You're within range"
+            : `${Math.round(locationState.distance)}m away — need to be within ${geofence?.radiusMeters}m`}
+        </Text>
+      </View>
+    );
+  };
+
+  if (!onDuty) {
+    return (
+      <>
+      <ScrollView style={styles.container} contentContainerStyle={{ paddingBottom: 24 }}>
+        <View style={styles.timeInCard}>
+          <View style={styles.iconCircle}>
+            <Feather name="map-pin" size={28} color={theme.primary} />
+          </View>
+          <Text style={styles.title}>Time In</Text>
+          {data.firstStop ? (
+            <>
+              <Text style={styles.subtitle}>
+                Get within range of {data.firstStop.client} to start your shift.
+              </Text>
+              {renderRangePill()}
+              <Pressable
+                style={[styles.primaryButton, !withinRange && styles.primaryButtonDisabled]}
+                onPress={() => setShowLocationDisclosure(true)}
+                disabled={!withinRange || timeInMutation.isPending}
+              >
+                {timeInMutation.isPending ? (
+                  <ActivityIndicator color={theme.primaryForeground} />
+                ) : (
+                  <Text style={styles.primaryButtonText}>Time In</Text>
+                )}
+              </Pressable>
+            </>
+          ) : (
+            <Text style={styles.subtitle}>You have no scheduled visits today.</Text>
+          )}
+        </View>
+
+        {/* Full-day preview, available before Time In — every client stop
+            scheduled today, not just the first one the gate above cares
+            about. One card per CLIENT (not per printer — that per-printer
+            breakdown only exists once on duty, see the on-duty render
+            below), each with its own Google Maps navigation icon. */}
+        {data.itinerary.length > 0 && (
+          <>
+            <Text style={styles.sectionTitle}>Today's itinerary</Text>
+            {data.itinerary.map((s) => (
+              <View key={s.id} style={styles.previewCard}>
+                <View style={styles.stopBadge}>
+                  <Text style={styles.stopBadgeText}>{s.sequence ?? "•"}</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.stopClient}>{s.client}</Text>
+                  <Text style={styles.stopLocation}>{s.location}</Text>
+                  {s.notes ? <Text style={styles.notes}>{s.notes}</Text> : null}
+                </View>
+                {s.latitude != null && s.longitude != null && (
+                  <Pressable
+                    style={styles.gpsButton}
+                    onPress={() => openInGoogleMaps(s.id, s.latitude as number, s.longitude as number)}
+                    disabled={resolvingNavId === s.id}
+                    hitSlop={8}
+                  >
+                    {resolvingNavId === s.id ? (
+                      <ActivityIndicator size="small" color={theme.primary} />
+                    ) : (
+                      <Feather name="navigation" size={18} color={theme.primary} />
+                    )}
+                  </Pressable>
+                )}
+              </View>
+            ))}
+          </>
+        )}
+
+        {data.tomorrowItinerary.length > 0 && (
+          <>
+            <Text style={styles.sectionTitle}>Tomorrow's itinerary</Text>
+            {data.tomorrowItinerary.map((s) => (
+              <View key={s.id} style={styles.stopCard}>
+                <View style={styles.stopBadge}>
+                  <Text style={styles.stopBadgeText}>{s.sequence ?? "•"}</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.stopClient}>{s.client}</Text>
+                  <Text style={styles.stopLocation}>{s.location}</Text>
+                </View>
+              </View>
+            ))}
+          </>
+        )}
+      </ScrollView>
+
+      {/* Location Access disclosure — shown on every Time In tap, requires
+          an explicit Continue before any permission is requested. Modal
+          renders as its own overlay (RN portals it above the ScrollView
+          regardless of nesting), so placement here vs. elsewhere in the
+          tree doesn't matter for how it displays. */}
+      <Modal
+        visible={showLocationDisclosure}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowLocationDisclosure(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalIconCircle}>
+              <Feather name="map-pin" size={24} color={theme.primary} />
+            </View>
+            <Text style={styles.modalTitle}>Location Access</Text>
+            <Text style={styles.modalBody}>
+              Fiix collects your location while you're on duty (from Time In
+              until Time Out) — including in the background, when the app is
+              minimized or your phone is locked.
+            </Text>
+            <Text style={styles.modalSubheading}>This is used for:</Text>
+            <View style={styles.modalBulletList}>
+              <Text style={styles.modalBullet}>• Verifying Time In / Time Out at the correct location</Text>
+              <Text style={styles.modalBullet}>• Giving dispatch visibility into where you are</Text>
+              <Text style={styles.modalBullet}>• Technician monitoring while on duty</Text>
+              <Text style={styles.modalBullet}>• Keeping your GPS status accurate on the dashboard</Text>
+            </View>
+            <Text style={styles.modalBody}>
+              Location tracking stops automatically as soon as you Time Out.
+            </Text>
+            <Pressable
+              style={styles.primaryButton}
+              onPress={() => {
+                setShowLocationDisclosure(false);
+                timeInMutation.mutate();
+              }}
+            >
+              <Text style={styles.primaryButtonText}>Continue</Text>
+            </Pressable>
+            <Pressable style={styles.modalDismiss} onPress={() => setShowLocationDisclosure(false)}>
+              <Text style={styles.modalDismissText}>Not now</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+    </>
+  );
+  }
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.statusBar}>
+        <View style={styles.onDutyBadge}>
+          <View style={styles.onDutyDot} />
+          <Text style={styles.onDutyText}>ON DUTY</Text>
+        </View>
+        {syncing && <Text style={styles.syncing}>Syncing offline reports…</Text>}
+      </View>
+      <Text style={styles.sectionTitle}>Today's itinerary</Text>
+      {scheduleQuery.isLoading ? (
+        <ActivityIndicator color={theme.primary} />
+      ) : scheduleQuery.isError ? (
+        <Text style={styles.error}>Couldn't load today's printers.</Text>
+      ) : (
+        <FlatList
+          data={scheduleQuery.data ?? []}
+          keyExtractor={(s) => String(s.id)}
+          contentContainerStyle={{ gap: 16 }}
+          renderItem={({ item: schedule }) => (
+            <View>
+              <Text style={styles.stopClient}>{schedule.client.name}</Text>
+              <Text style={styles.stopLocation}>{schedule.location.name}</Text>
+              <View style={{ gap: 8, marginTop: 8 }}>
+                {schedule.scheduleDetails.map((detail) => (
+                  <Pressable
+                    key={detail.id}
+                    style={[styles.printerRow, detail.isMaintained && styles.printerRowDone]}
+                    onPress={() => openMaintenance(detail)}
+                  >
+                    <View style={styles.printerIconWrap}>
+                      <Feather
+                        name={detail.isMaintained ? "check-circle" : "printer"}
+                        size={16}
+                        color={detail.isMaintained ? theme.success : theme.primary}
+                      />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.printerModel}>{detail.printer.model.name ?? "Printer"}</Text>
+                      <Text style={styles.printerSerial}>{detail.printer.serialNo}</Text>
+                    </View>
+                    {!detail.isMaintained && (
+                      <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
+                    )}
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+          )}
+        />
+      )}
+      <Pressable
+        style={[styles.primaryButton, styles.timeOutButton]}
+        onPress={() => timeOutMutation.mutate()}
+        disabled={timeOutMutation.isPending}
+      >
+        {timeOutMutation.isPending ? (
+          <ActivityIndicator color="#fff" />
+        ) : (
+          <Text style={[styles.primaryButtonText, { color: "#fff" }]}>Time Out</Text>
+        )}
+      </Pressable>
+    </View>
+  );
+}
+
+function createStyles(theme: Palette) {
+  return StyleSheet.create({
+    container: { flex: 1, backgroundColor: theme.background, padding: 16 },
+    centered: {
+      flex: 1,
+      alignItems: "center",
+      justifyContent: "center",
+      padding: 24,
+      gap: 12,
+      backgroundColor: theme.background,
+    },
+    title: { fontSize: 20, fontWeight: "700", color: theme.foreground },
+    subtitle: { color: theme.mutedForeground, textAlign: "center" },
+    error: { color: theme.destructive, textAlign: "center" },
+
+    timeInCard: {
+      backgroundColor: theme.card,
+      borderRadius: theme.radius,
+      borderWidth: 1,
+      borderColor: theme.border,
+      padding: 24,
+      alignItems: "center",
+      gap: 8,
+    },
+    iconCircle: {
+      width: 56,
+      height: 56,
+      borderRadius: 28,
+      backgroundColor: theme.accent,
+      alignItems: "center",
+      justifyContent: "center",
+      marginBottom: 8,
+    },
+    rangePill: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 6,
+      paddingHorizontal: 12,
+      paddingVertical: 6,
+      borderRadius: 999,
+      marginTop: 4,
+      marginBottom: 8,
+      maxWidth: "100%",
+    },
+    rangePillOk: { backgroundColor: "rgba(0,187,144,0.15)" },
+    rangePillOut: { backgroundColor: "rgba(233,171,43,0.15)" },
+    rangePillText: { fontSize: 12, fontWeight: "600", flexShrink: 1 },
+
+    primaryButton: {
+      backgroundColor: theme.primary,
+      borderRadius: theme.radius,
+      paddingVertical: 14,
+      alignItems: "center",
+      justifyContent: "center",
+      width: "100%",
+      marginTop: 8,
+    },
+    primaryButtonDisabled: { backgroundColor: theme.muted },
+    primaryButtonText: { color: theme.primaryForeground, fontWeight: "700", fontSize: 16 },
+    timeOutButton: { backgroundColor: theme.destructive, marginTop: 16 },
+
+    secondaryButton: {
+      borderWidth: 1,
+      borderColor: theme.border,
+      borderRadius: theme.radius,
+      paddingVertical: 10,
+      paddingHorizontal: 20,
+    },
+    secondaryButtonText: { color: theme.foreground, fontWeight: "600" },
+
+    sectionTitle: {
+      fontSize: 14,
+      fontWeight: "700",
+      color: theme.mutedForeground,
+      marginTop: 24,
+      marginBottom: 10,
+      textTransform: "uppercase",
+      letterSpacing: 0.5,
+    },
+    stopCard: {
+      flexDirection: "row",
+      gap: 12,
+      backgroundColor: theme.card,
+      borderRadius: theme.radius,
+      borderWidth: 1,
+      borderColor: theme.border,
+      padding: 14,
+      marginBottom: 10,
+    },
+    previewCard: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 12,
+      backgroundColor: theme.card,
+      borderRadius: theme.radius,
+      borderWidth: 1,
+      borderColor: theme.border,
+      padding: 14,
+      marginBottom: 10,
+    },
+    gpsButton: {
+      width: 36,
+      height: 36,
+      borderRadius: 18,
+      backgroundColor: theme.accent,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    stopBadge: {
+      width: 26,
+      height: 26,
+      borderRadius: 13,
+      backgroundColor: theme.muted,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    stopBadgeText: { color: theme.mutedForeground, fontSize: 12, fontWeight: "700" },
+    stopClient: { color: theme.foreground, fontWeight: "700", fontSize: 15 },
+    stopLocation: { color: theme.mutedForeground, fontSize: 13, marginTop: 2 },
+    notes: { color: theme.info, fontSize: 12, marginTop: 4, fontStyle: "italic" },
+
+    printerRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 10,
+      backgroundColor: theme.card,
+      borderRadius: theme.radius,
+      borderWidth: 1,
+      borderColor: theme.border,
+      padding: 12,
+    },
+    printerRowDone: { opacity: 0.6 },
+    printerIconWrap: {
+      width: 32,
+      height: 32,
+      borderRadius: 16,
+      backgroundColor: theme.accent,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    printerModel: { color: theme.foreground, fontWeight: "700", fontSize: 14 },
+    printerSerial: { color: theme.mutedForeground, fontSize: 12, marginTop: 1 },
+
+    statusBar: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4 },
+    onDutyBadge: { flexDirection: "row", alignItems: "center", gap: 6 },
+    onDutyDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: theme.primary },
+    onDutyText: { color: theme.primary, fontWeight: "700", fontSize: 12, letterSpacing: 0.5 },
+    syncing: { color: theme.info, fontSize: 12 },
+
+    modalBackdrop: {
+      flex: 1,
+      backgroundColor: "rgba(0,0,0,0.55)",
+      alignItems: "center",
+      justifyContent: "center",
+      padding: 24,
+    },
+    modalCard: {
+      width: "100%",
+      maxWidth: 420,
+      backgroundColor: theme.card,
+      borderRadius: theme.radius,
+      borderWidth: 1,
+      borderColor: theme.border,
+      padding: 24,
+      alignItems: "center",
+      gap: 8,
+    },
+    modalIconCircle: {
+      width: 48,
+      height: 48,
+      borderRadius: 24,
+      backgroundColor: theme.accent,
+      alignItems: "center",
+      justifyContent: "center",
+      marginBottom: 4,
+    },
+    modalTitle: { fontSize: 18, fontWeight: "700", color: theme.foreground },
+    modalBody: { color: theme.mutedForeground, textAlign: "center", fontSize: 13, lineHeight: 19 },
+    modalSubheading: {
+      alignSelf: "flex-start",
+      color: theme.foreground,
+      fontWeight: "700",
+      fontSize: 13,
+      marginTop: 4,
+    },
+    modalBulletList: { alignSelf: "stretch", gap: 4, marginBottom: 4 },
+    modalBullet: { color: theme.mutedForeground, fontSize: 13, lineHeight: 19 },
+    modalDismiss: { marginTop: 4, padding: 8 },
+    modalDismissText: { color: theme.mutedForeground, fontSize: 13, fontWeight: "600" },
+  });
+}

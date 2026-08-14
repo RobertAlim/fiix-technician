@@ -1,0 +1,100 @@
+{
+  "expo": {
+    "name": "Fiix Technician",
+    "slug": "fiix-technician",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "scheme": "fiixtechnician",
+    "platforms": [
+      "ios",
+      "android"
+    ],
+    "newArchEnabled": true,
+    "splash": {
+      "backgroundColor": "#0f172a"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.fruitbeanink.fiixtechnician",
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "location",
+          "fetch",
+          "location",
+          "fetch"
+        ],
+        "NSLocationWhenInUseUsageDescription": "Fiix needs your location to verify Time In/Out and to guide you to client locations.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Fiix needs to track your location in the background while you're clocked in, so dispatch can see technician positions and reach you if GPS drops.",
+        "NSCameraUsageDescription": "Fiix needs camera access to attach photos to maintenance reports.",
+        "NSPhotoLibraryUsageDescription": "Fiix needs photo library access to attach existing photos to maintenance reports.",
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "com.fruitbeanink.fiixtechnician",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "CAMERA",
+        "POST_NOTIFICATIONS",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_BACKGROUND_LOCATION",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_LOCATION",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0f172a"
+      }
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "ndkVersion": "26.1.10909125",
+            "packagingOptions": {
+              "pickFirst": [
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+              ]
+            }
+          }
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Fiix needs to track your location in the background while you're clocked in, so dispatch can see technician positions and reach you if GPS drops.",
+          "locationAlwaysPermission": "Fiix needs background location access while you're clocked in.",
+          "locationWhenInUsePermission": "Fiix needs your location to verify Time In/Out.",
+          "isIosBackgroundLocationEnabled": true,
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Fiix needs camera access to attach photos to maintenance reports."
+        }
+      ],
+      "expo-secure-store"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "b30fc50c-5fb1-4612-9aa6-a20c68819cf5"
+      }
+    }
+  }
+}
