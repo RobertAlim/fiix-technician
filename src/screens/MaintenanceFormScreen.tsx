@@ -621,12 +621,40 @@ export function MaintenanceFormScreen() {
           ref={sigRef}
           onOK={onSignatureOK}
           onBegin={() => setSignatureDrawing(true)}
-          onEnd={() => setSignatureDrawing(false)}
+          // THE ACTUAL BUG: drawing on this canvas never populates
+          // `signatureUri` on its own — react-native-signature-canvas
+          // only converts strokes to data when readSignature() is
+          // explicitly called, which nothing here was doing. A
+          // technician could draw a perfectly valid signature and still
+          // get "A signature is required" on save, because the state
+          // this screen checks was never set. Calling readSignature()
+          // here — every time a stroke ends — keeps signatureUri
+          // continuously up to date as the technician draws, so by the
+          // time they tap Save Maintenance (however much later) it's
+          // already captured, with no separate "confirm" step to
+          // remember.
+          onEnd={() => {
+            setSignatureDrawing(false);
+            sigRef.current?.readSignature();
+          }}
           descriptionText=""
           webStyle="body,html{background:#fff;}"
         />
       </View>
-      <Pressable style={styles.secondaryButton} onPress={() => sigRef.current?.clearSignature()}>
+      <Pressable
+        style={styles.secondaryButton}
+        onPress={() => {
+          sigRef.current?.clearSignature();
+          // clearSignature() only wipes the visual canvas — it doesn't
+          // touch signatureUri, which the onEnd-driven auto-capture above
+          // may already have populated from drawing before this tap.
+          // Without this, a technician who draws, then clears and
+          // reconsiders, would still have the OLD captured signature
+          // silently attached to the submission despite the canvas
+          // looking empty.
+          setSignatureUri(null);
+        }}
+      >
         <Text style={styles.secondaryButtonText}>Clear Signature</Text>
       </Pressable>
 

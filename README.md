@@ -4,6 +4,29 @@ A Technician-only companion app to the Fiix web app, built so background
 GPS pings keep flowing while the screen is off or the app is backgrounded —
 something a browser tab fundamentally can't do.
 
+## ⚠️ "A signature is required" even after signing — real capture bug, not a validation bug
+
+Reported with a screenshot showing a clearly drawn signature still
+triggering this exact error. Root cause: `react-native-signature-canvas`
+does **not** convert drawn strokes into usable data on its own — nothing
+happens until `readSignature()` is explicitly called on the ref, which
+this screen was never doing. A technician could draw a perfectly valid
+signature and `signatureUri` (the state `validate()` actually checks)
+would simply never be set, no matter how much was drawn.
+
+Fixed by calling `sigRef.current?.readSignature()` from the canvas's own
+`onEnd` callback — every time a stroke ends, not just once at some
+separate "confirm" step the UI never actually had. By the time a
+technician taps Save Maintenance, whatever they last drew is already
+captured, with nothing extra to remember.
+
+Found and fixed a second, related bug while in here: **Clear Signature**
+only ever wiped the visual canvas — it never reset `signatureUri` itself.
+Combined with the new auto-capture-on-stroke-end above, a technician who
+drew a signature, then cleared and reconsidered, would have submitted
+with the OLD signature still silently attached despite the canvas looking
+empty. `setSignatureUri(null)` now runs alongside `clearSignature()`.
+
 ## ⚠️ Real root cause of "Request failed: 500" found — `signPath` NOT NULL violation
 
 Traced from actual Vercel logs this time, not guessed: every mobile
