@@ -273,8 +273,13 @@ export function DashboardScreen() {
   }, [onDuty, geofence?.latitude, geofence?.longitude]);
 
   useEffect(() => {
+    console.log(`[gps] onDuty effect: onDuty=${onDuty} gpsBackgroundActive=${gpsBackgroundActive}`);
     if (onDuty && !gpsBackgroundActive) {
-      startBackgroundGpsReporting().then(() => setGpsBackgroundActive(true));
+      startBackgroundGpsReporting()
+        .then(() => setGpsBackgroundActive(true))
+        .catch((err) =>
+          console.log("[gps] failed to start background reporting from Dashboard effect", err)
+        );
     } else if (!onDuty && gpsBackgroundActive) {
       stopBackgroundGpsReporting().then(() => setGpsBackgroundActive(false));
     }
@@ -548,6 +553,15 @@ export function DashboardScreen() {
             <Text style={styles.modalBody}>
               Location tracking stops automatically as soon as you Time Out.
             </Text>
+            <View style={styles.modalNoticeBox}>
+              <Feather name="info" size={14} color={theme.info} style={{ marginTop: 1 }} />
+              <Text style={styles.modalNoticeText}>
+                You may see two permission prompts. Please accept both — the
+                second one asks to upgrade to{" "}
+                <Text style={{ fontWeight: "700" }}>"Allow all the time."</Text>{" "}
+                Time In won't work with only "While using the app."
+              </Text>
+            </View>
             <Pressable
               style={styles.primaryButton}
               onPress={() => {
@@ -820,6 +834,16 @@ function createStyles(theme: Palette) {
     },
     modalBulletList: { alignSelf: "stretch", gap: 4, marginBottom: 4 },
     modalBullet: { color: theme.mutedForeground, fontSize: 13, lineHeight: 19 },
+    modalNoticeBox: {
+      flexDirection: "row",
+      gap: 8,
+      alignSelf: "stretch",
+      backgroundColor: theme.accent,
+      borderRadius: 12,
+      padding: 12,
+      marginTop: 4,
+    },
+    modalNoticeText: { flex: 1, color: theme.foreground, fontSize: 12, lineHeight: 17 },
     modalDismiss: { marginTop: 4, padding: 8 },
     modalDismissText: { color: theme.mutedForeground, fontSize: 13, fontWeight: "600" },
   });

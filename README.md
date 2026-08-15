@@ -603,5 +603,3 @@ assumed — several didn't match my first guess and were corrected in place:
 - **Typechecked but not runtime-tested.** `npx tsc --noEmit` passes clean
   and `npm install` resolves, but this hasn't been run on a simulator/
   device or against the real API — do that before rolling it out.
-#   f i i x - t e c h n i c i a n  
- 

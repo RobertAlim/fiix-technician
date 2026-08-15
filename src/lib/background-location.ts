@@ -60,8 +60,11 @@ async function getBackendToken(): Promise<string | null> {
 async function sendPing(body: Record<string, unknown>) {
   try {
     const token = await getBackendToken();
-    if (!token) return; // no active session to authenticate with — skip silently
-    await fetch(`${API_BASE_URL}/api/gps/ping`, {
+    if (!token) {
+      console.log("[gps] ping skipped: no auth token available", body);
+      return; // no active session to authenticate with — skip silently
+    }
+    const res = await fetch(`${API_BASE_URL}/api/gps/ping`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -69,17 +72,24 @@ async function sendPing(body: Record<string, unknown>) {
       },
       body: JSON.stringify(body),
     });
-  } catch {
-    // Silent by design, same rationale as the web GpsReporter: a dropped
-    // ping isn't worth retrying, another one is on the way shortly, and
-    // this must never surface an error to a technician mid-shift.
+    console.log(`[gps] ping sent: ${res.status}`, body);
+  } catch (err) {
+    // Silent to the technician by design, same rationale as the web
+    // GpsReporter: a dropped ping isn't worth retrying, another one is on
+    // the way shortly, and this must never surface an error mid-shift.
+    // Still logged (console output isn't user-visible) — this exact spot
+    // was completely silent before, with no way to tell "the request
+    // never went out" apart from "it went out and nothing came back."
+    console.log("[gps] ping failed", err instanceof Error ? err.message : String(err), body);
   }
 }
 
 let lastSentAt = 0;
 
 TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
+  console.log("[gps] task fired", { hasError: !!error, hasData: !!data });
   if (error) {
+    console.log("[gps] task error", error.message);
     await sendPing({ enabled: false });
     return;
   }
@@ -87,10 +97,16 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
     locations: [],
   };
   const fix = locations?.[locations.length - 1];
-  if (!fix) return;
+  if (!fix) {
+    console.log("[gps] task fired with no location in payload");
+    return;
+  }
 
   const now = Date.now();
-  if (now - lastSentAt < GPS_PING_INTERVAL_MS) return;
+  if (now - lastSentAt < GPS_PING_INTERVAL_MS) {
+    console.log(`[gps] fix received but throttled (${now - lastSentAt}ms since last send)`);
+    return;
+  }
   lastSentAt = now;
 
   await sendPing({
@@ -115,28 +131,40 @@ export async function startBackgroundGpsReporting(): Promise<void> {
   const already = await Location.hasStartedLocationUpdatesAsync(
     BACKGROUND_LOCATION_TASK
   ).catch(() => false);
-  if (already) return;
+  if (already) {
+    console.log("[gps] startBackgroundGpsReporting: already running, no-op");
+    return;
+  }
 
   lastSentAt = 0;
-  await Location.startLocationUpdatesAsync(BACKGROUND_LOCATION_TASK, {
-    accuracy: Location.Accuracy.Balanced,
-    timeInterval: GPS_PING_INTERVAL_MS,
-    distanceInterval: GPS_DISTANCE_FILTER_METERS,
-    // Android foreground-service notification — required by Android 8+ to
-    // run a location service while backgrounded; also the honest signal
-    // to the technician that tracking is active while on duty, AND the
-    // reason the JS engine (and therefore the Clerk singleton above)
-    // stays alive instead of being reclaimed by the OS.
-    foregroundService: {
-      notificationTitle: "Fiix — On duty",
-      notificationBody: "Sharing your location with dispatch while you're clocked in.",
-      notificationColor: "#0f172a",
-    },
-    // iOS: keeps delivering updates (not just significant-change) while
-    // backgrounded, per the platform caveat above.
-    showsBackgroundLocationIndicator: true,
-    pausesUpdatesAutomatically: false,
-  });
+  try {
+    await Location.startLocationUpdatesAsync(BACKGROUND_LOCATION_TASK, {
+      accuracy: Location.Accuracy.Balanced,
+      timeInterval: GPS_PING_INTERVAL_MS,
+      distanceInterval: GPS_DISTANCE_FILTER_METERS,
+      // Android foreground-service notification — required by Android 8+ to
+      // run a location service while backgrounded; also the honest signal
+      // to the technician that tracking is active while on duty, AND the
+      // reason the JS engine (and therefore the Clerk singleton above)
+      // stays alive instead of being reclaimed by the OS.
+      foregroundService: {
+        notificationTitle: "Fiix — On duty",
+        notificationBody: "Sharing your location with dispatch while you're clocked in.",
+        notificationColor: "#0f172a",
+      },
+      // iOS: keeps delivering updates (not just significant-change) while
+      // backgrounded, per the platform caveat above.
+      showsBackgroundLocationIndicator: true,
+      pausesUpdatesAutomatically: false,
+    });
+    console.log("[gps] startBackgroundGpsReporting: started successfully");
+  } catch (err) {
+    console.log(
+      "[gps] startBackgroundGpsReporting FAILED to start",
+      err instanceof Error ? err.message : String(err)
+    );
+    throw err;
+  }
 }
 
 export async function stopBackgroundGpsReporting(): Promise<void> {
