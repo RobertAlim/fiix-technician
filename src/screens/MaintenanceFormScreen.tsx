@@ -267,6 +267,18 @@ export function MaintenanceFormScreen() {
     if (!statusId) return "Status is required.";
     if (!signatoryId) return "Signatory is required.";
     if (!nozzlePhotoUri) return "A nozzle check photo is required.";
+    // maintain.signPath is NOT NULL in the actual database schema — found
+    // this the hard way via a Vercel log showing a real Postgres
+    // constraint violation (23502) for a report saved without one. The
+    // Zod submit schema itself marks signPath as .optional(), which is a
+    // pre-existing mismatch with the DB constraint on the web app's own
+    // validation layers, not something safe to rely on — the database is
+    // the real source of truth for what a submission must contain
+    // regardless of how permissive the schema is. Checked here so an
+    // un-signed report can never reach the offline queue at all, rather
+    // than syncing 30+ times against a constraint it can structurally
+    // never satisfy.
+    if (!signatureUri) return "A signature is required.";
     if (replace && replaceParts.length === 0) return "Please select at least one replacement part.";
     if (repair && repairParts.length === 0) return "Please select at least one repair part.";
     if (colorSelected && !cyan && !magenta && !yellow && !black) return "Please select at least one color.";
@@ -603,7 +615,7 @@ export function MaintenanceFormScreen() {
         <Text style={styles.secondaryButtonText}>Take Photo</Text>
       </Pressable>
 
-      <Text style={styles.label}>Signatory signature</Text>
+      <Text style={styles.label}>Signatory signature (required)</Text>
       <View style={styles.sigBox}>
         <SignatureScreen
           ref={sigRef}

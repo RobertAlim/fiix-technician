@@ -78,6 +78,7 @@ export function MaintenanceListScreen() {
           online={sync.online}
           syncing={sync.syncing}
           onSyncNow={sync.runDrain}
+          onReportsChanged={sync.refreshReports}
         />
       </View>
       <View style={styles.row}>

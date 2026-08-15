@@ -50,6 +50,18 @@ function getDb() {
       // (not data loss) if the column's already there, which this
       // swallows rather than crashing app startup over.
       await db.execAsync(`ALTER TABLE queued_reports ADD COLUMN schedDetailsId INTEGER;`).catch(() => {});
+      // Recovery for reports orphaned in "syncing" — this can only happen
+      // from a session that ended (app killed, or the drainQueue
+      // concurrency bug fixed alongside this) before the attempt that set
+      // it actually finished either way. Nothing can still legitimately
+      // be "in flight" at a fresh app start; the in-memory promise that
+      // would eventually call markFailed/removeReport died with the
+      // previous JS context. Without this, such a row stays "syncing"
+      // forever — drainQueue's own `if (status === "syncing") continue`
+      // guard means it would never be retried by anything again.
+      await db.execAsync(
+        `UPDATE queued_reports SET status = 'pending' WHERE status = 'syncing';`
+      ).catch(() => {});
       return db;
     });
   }

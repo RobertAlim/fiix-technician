@@ -18,10 +18,18 @@ import {
   QueuedReport,
 } from "@/lib/offline-db";
 
-// R2 bucket name the web app's offline-sync pipeline presigns against for
-// maintenance photos/signatures — keep in sync with
-// features/offline-sync/config.ts on the web repo if that ever changes.
-const R2_BUCKET = "fiix-uploads";
+// R2 buckets, checked directly against the real allowlist this round
+// (lib/r2.ts's ALLOWED_BUCKETS + features/offline-sync/config.ts's
+// per-upload-type mapping) after a "Bucket not allowed" error surfaced —
+// the single hardcoded "fiix-uploads" this constant used to hold was
+// never actually verified against anything and doesn't match ANY of the
+// three real allowed values (env.bucketName, "fiixdrive", "fiixnozzle").
+// Web uses a DIFFERENT bucket per upload kind, not one bucket for
+// everything — nozzle photos and signatures are genuinely split.
+const R2_BUCKETS = {
+  nozzle: "fiixnozzle",
+  signature: "fiixdrive",
+} as const;
 
 /**
  * Presign-then-PUT one local file straight to R2 — same two-step protocol
@@ -34,21 +42,34 @@ async function uploadToR2(
   api: ApiClient,
   localUri: string,
   key: string,
+  bucketName: string,
   contentType = "image/jpeg"
 ): Promise<string> {
   const { url } = await api.post<{ url: string }>("/api/get-upload-url", {
     key,
     contentType,
-    bucketName: R2_BUCKET,
+    bucketName,
   });
 
   const fileRes = await fetch(localUri);
   const blob = await fileRes.blob();
-  const putRes = await fetch(url, {
-    method: "PUT",
-    headers: { "Content-Type": contentType },
-    body: blob,
-  });
+  // Same reasoning as the api.ts timeout — an unbounded PUT of an actual
+  // file (not a small JSON body) is if anything MORE likely to stall on a
+  // weak mobile connection, and was the other half of what let a report
+  // get stuck showing "Uploading" forever with no automatic recovery.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60_000);
+  let putRes: Response;
+  try {
+    putRes = await fetch(url, {
+      method: "PUT",
+      headers: { "Content-Type": contentType },
+      body: blob,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
   if (!putRes.ok) {
     throw new Error(`R2 upload failed (${putRes.status}) for ${key}`);
   }
@@ -67,12 +88,31 @@ async function syncOne(api: ApiClient, item: QueuedReport): Promise<void> {
     // exists before this ever queues.
     const [nozzleUri] = photoUris;
     const nozzlePath = nozzleUri
-      ? await uploadToR2(api, nozzleUri, `maintain/${item.id}/nozzle.jpg`)
+      ? await uploadToR2(api, nozzleUri, `maintain/${item.id}/nozzle.jpg`, R2_BUCKETS.nozzle)
       : undefined;
 
     const signPath = item.signatureLocalUri
-      ? await uploadToR2(api, item.signatureLocalUri, `maintain/${item.id}/signature.png`, "image/png")
-      : undefined;
+      ? await uploadToR2(
+          api,
+          item.signatureLocalUri,
+          `maintain/${item.id}/signature.png`,
+          R2_BUCKETS.signature,
+          "image/png"
+        )
+      // "Unsigned" — matches features/offline-sync/save-maintenance-
+      // report.ts's `signKey ?? "Unsigned"` exactly. This is a real,
+      // pervasive sentinel value the web app checks in at least eight
+      // places (PDF report rendering, dashboards, the purge tool) — not
+      // an edge case being invented here. `maintain.signPath` is a real
+      // NOT NULL column in production (confirmed via a live Postgres
+      // constraint-violation error, even though the local schema.ts file
+      // doesn't currently declare `.notNull()` — see the fix there too),
+      // so sending `undefined` here — which JSON.stringify simply drops
+      // from the request body entirely — reliably crashed the insert for
+      // every report a technician submitted without signing. This isn't
+      // a workaround; it's the same real value the rest of the app
+      // already treats as the canonical "no signature yet" state.
+      : "Unsigned";
 
     const { id: mtId } = await api.post<{ id: number }>("/api/maintain", {
       ...payload,
@@ -109,20 +149,43 @@ async function syncOne(api: ApiClient, item: QueuedReport): Promise<void> {
   }
 }
 
+// Module-level, not per-hook — this is the actual fix for reports getting
+// stuck showing "Uploading" indefinitely. useOfflineSync() is called from
+// BOTH DashboardScreen (for the itinerary's "Queued" badges) and
+// MaintenanceListScreen independently; with a tab navigator keeping both
+// mounted at once, that's two fully separate hook instances each running
+// their own mount-time drain. `item.status === "syncing"` alone doesn't
+// prevent that — it's checked once per drainQueue() CALL, not shared
+// across calls, so two overlapping calls can each grab a DIFFERENT
+// pending item at the same moment and upload both concurrently. This
+// guard makes every call — regardless of how many components ever call
+// the hook — share the single actually-running pass instead of starting
+// a new one, the same way a mutex would, without needing every caller to
+// coordinate with each other.
+let activeDrain: Promise<{ synced: number; failed: number }> | null = null;
+
 export async function drainQueue(api: ApiClient): Promise<{ synced: number; failed: number }> {
-  const items = await listQueuedReports();
-  let synced = 0;
-  let failed = 0;
-  for (const item of items) {
-    if (item.status === "syncing") continue; // already in-flight from a prior call
-    try {
-      await syncOne(api, item);
-      synced += 1;
-    } catch {
-      failed += 1;
-      // Keep going — one bad report (e.g. a since-deleted printer id)
-      // must not block the rest of the queue from syncing.
+  if (activeDrain) return activeDrain;
+  activeDrain = (async () => {
+    const items = await listQueuedReports();
+    let synced = 0;
+    let failed = 0;
+    for (const item of items) {
+      if (item.status === "syncing") continue; // already in-flight from a prior call
+      try {
+        await syncOne(api, item);
+        synced += 1;
+      } catch {
+        failed += 1;
+        // Keep going — one bad report (e.g. a since-deleted printer id)
+        // must not block the rest of the queue from syncing.
+      }
     }
+    return { synced, failed };
+  })();
+  try {
+    return await activeDrain;
+  } finally {
+    activeDrain = null;
   }
-  return { synced, failed };
 }

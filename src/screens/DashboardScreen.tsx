@@ -128,7 +128,23 @@ export function DashboardScreen() {
   const queryClient = useQueryClient();
   const { theme } = useAppTheme();
   const styles = createStyles(theme);
-  const { syncing } = useOfflineSync();
+  const offlineSync = useOfflineSync();
+  const { syncing } = offlineSync;
+
+  // schedDetailsId values with a report currently sitting in the local
+  // offline queue (pending, actively uploading, OR failed-but-retryable —
+  // all three still represent "a report for this printer already
+  // exists," just not yet confirmed by the server). This closes the
+  // exact gap that let a technician queue a second, duplicate report for
+  // the same printer: the server's own isMaintained flag only flips once
+  // a sync actually completes, so between "saved offline" and "synced,"
+  // detail.isMaintained is still false and the row would otherwise look
+  // untouched and tappable.
+  const locallyQueuedSchedDetailIds = new Set(
+    offlineSync.reports
+      .map((r) => r.schedDetailsId)
+      .filter((id): id is number => id != null)
+  );
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
   const [gpsBackgroundActive, setGpsBackgroundActive] = useState(false);
   const [locationState, setLocationState] = useState<LocationState>({ kind: "checking" });
@@ -162,6 +178,13 @@ export function DashboardScreen() {
   const openMaintenance = (detail: ScheduleDetailRow) => {
     if (detail.isMaintained) {
       Alert.alert("Already completed", "This printer's maintenance for today is already recorded.");
+      return;
+    }
+    if (locallyQueuedSchedDetailIds.has(detail.id)) {
+      Alert.alert(
+        "Already queued",
+        "A maintenance report for this printer is already saved and waiting to sync — check the Maintenance tab's Synchronization panel for its status."
+      );
       return;
     }
     navigation.navigate("MaintenanceForm", {
@@ -605,28 +628,46 @@ export function DashboardScreen() {
               <Text style={styles.stopClient}>{schedule.client.name}</Text>
               <Text style={styles.stopLocation}>{schedule.location.name}</Text>
               <View style={{ gap: 8, marginTop: 8 }}>
-                {schedule.scheduleDetails.map((detail) => (
-                  <Pressable
-                    key={detail.id}
-                    style={[styles.printerRow, detail.isMaintained && styles.printerRowDone]}
-                    onPress={() => openMaintenance(detail)}
-                  >
-                    <View style={styles.printerIconWrap}>
-                      <Feather
-                        name={detail.isMaintained ? "check-circle" : "printer"}
-                        size={16}
-                        color={detail.isMaintained ? theme.success : theme.primary}
-                      />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.printerModel}>{detail.printer.model.name ?? "Printer"}</Text>
-                      <Text style={styles.printerSerial}>{detail.printer.serialNo}</Text>
-                    </View>
-                    {!detail.isMaintained && (
-                      <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
-                    )}
-                  </Pressable>
-                ))}
+                {schedule.scheduleDetails.map((detail) => {
+                  const isQueued = locallyQueuedSchedDetailIds.has(detail.id);
+                  const isLocked = detail.isMaintained || isQueued;
+                  return (
+                    <Pressable
+                      key={detail.id}
+                      style={[styles.printerRow, isLocked && styles.printerRowDone]}
+                      onPress={() => openMaintenance(detail)}
+                    >
+                      <View style={styles.printerIconWrap}>
+                        <Feather
+                          name={detail.isMaintained ? "check-circle" : isQueued ? "clock" : "printer"}
+                          size={16}
+                          color={
+                            detail.isMaintained
+                              ? theme.success
+                              : isQueued
+                              ? theme.warning
+                              : theme.primary
+                          }
+                        />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.printerModel}>{detail.printer.model.name ?? "Printer"}</Text>
+                        <Text style={styles.printerSerial}>{detail.printer.serialNo}</Text>
+                      </View>
+                      {detail.isMaintained ? (
+                        <View style={[styles.statusBadge, styles.statusBadgeDone]}>
+                          <Text style={[styles.statusBadgeText, { color: theme.success }]}>Saved</Text>
+                        </View>
+                      ) : isQueued ? (
+                        <View style={[styles.statusBadge, styles.statusBadgeQueued]}>
+                          <Text style={[styles.statusBadgeText, { color: theme.warning }]}>Queued</Text>
+                        </View>
+                      ) : (
+                        <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
+                      )}
+                    </Pressable>
+                  );
+                })}
               </View>
             </View>
           )}
@@ -779,6 +820,14 @@ function createStyles(theme: Palette) {
       padding: 12,
     },
     printerRowDone: { opacity: 0.6 },
+    statusBadge: {
+      borderRadius: 999,
+      paddingHorizontal: 8,
+      paddingVertical: 3,
+    },
+    statusBadgeDone: { backgroundColor: "rgba(67,185,102,0.15)" },
+    statusBadgeQueued: { backgroundColor: "rgba(233,171,43,0.15)" },
+    statusBadgeText: { fontSize: 10, fontWeight: "700" },
     printerIconWrap: {
       width: 32,
       height: 32,

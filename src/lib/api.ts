@@ -48,7 +48,26 @@ async function request<T>(
   // Go, where @clerk/expo's native module isn't available) rather than a
   // routing/URL problem.
   console.log(`[api] ${options.method ?? "GET"} ${url} (token: ${token ? "YES" : "NO"})`);
-  const res = await fetch(url, { ...options, headers });
+  // Without this, a stalled request (bad connection, unresponsive server)
+  // hangs forever — fetch() has no default timeout. That's exactly what
+  // let a queued maintenance report get permanently stuck showing
+  // "Uploading" with no automatic recovery: the promise driving
+  // markSyncing()/markFailed() in sync-engine.ts never settled either
+  // way. 30s covers a genuinely slow mobile connection without leaving a
+  // hung request tying up a report indefinitely.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30_000);
+  let res: Response;
+  try {
+    res = await fetch(url, { ...options, headers, signal: controller.signal });
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new ApiError(0, "Request timed out", url);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
   if (res.redirected) {
     // fetch() follows redirects by default — if the server sent one (e.g.
     // Clerk's middleware redirecting an unauthenticated request toward a

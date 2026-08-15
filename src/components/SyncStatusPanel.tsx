@@ -21,12 +21,12 @@
 // mobile does track (pending/uploading/failed) are the ones that actually
 // change what a technician needs to do about a report.
 import React, { useMemo, useState } from "react";
-import { View, Text, Pressable, StyleSheet, Modal, ScrollView, ActivityIndicator } from "react-native";
+import { View, Text, Pressable, StyleSheet, Modal, ScrollView, ActivityIndicator, Alert } from "react-native";
 import { Feather } from "@expo/vector-icons";
 import { useAppTheme } from "@/theme";
 import { Palette } from "@/theme/palettes";
 import { formatRelativeTime } from "@/lib/relative-time";
-import { QueuedReport } from "@/lib/offline-db";
+import { QueuedReport, removeReport } from "@/lib/offline-db";
 
 interface Props {
   reports: QueuedReport[];
@@ -36,6 +36,11 @@ interface Props {
   online: boolean;
   syncing: boolean;
   onSyncNow: () => void;
+  /** Called after a report is manually discarded, so the parent's
+   * `useOfflineSync` state (and anything else keyed off the queue, like
+   * DashboardScreen's "Queued" itinerary badges) refreshes immediately
+   * instead of waiting for the next 3s poll. */
+  onReportsChanged: () => void;
 }
 
 function statusMeta(theme: Palette, status: QueuedReport["status"]) {
@@ -62,10 +67,33 @@ export function SyncStatusPanel({
   online,
   syncing,
   onSyncNow,
+  onReportsChanged,
 }: Props) {
   const { theme } = useAppTheme();
   const styles = createStyles(theme);
   const [open, setOpen] = useState(false);
+
+  const discardReport = (report: QueuedReport) => {
+    Alert.alert(
+      "Discard this report?",
+      "This deletes the queued maintenance report from this device permanently — it will never be sent to the server. Only do this for a report that's genuinely stuck (many failed attempts), not one that's still worth retrying.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Discard",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              await removeReport(report.id);
+              onReportsChanged();
+            } catch (err) {
+              Alert.alert("Couldn't discard", err instanceof Error ? err.message : String(err));
+            }
+          },
+        },
+      ]
+    );
+  };
 
   const overall = useMemo(() => {
     if (!online) return { color: theme.warning, label: "Offline", icon: "cloud-off" as const };
@@ -131,6 +159,14 @@ export function SyncStatusPanel({
                 {reports.map((r) => {
                   const meta = statusMeta(theme, r.status);
                   const gpsAccuracy = tryGetGpsAccuracy(r.payload);
+                  // A report's lastError is only from its MOST RECENT
+                  // completed attempt — while a fresh retry is actively
+                  // in flight (status "syncing"), showing that old text
+                  // reads as "this attempt is failing" when it's really
+                  // just leftover from the attempt before. Hidden here,
+                  // not cleared from storage, so it's still there to show
+                  // again immediately if this attempt fails too.
+                  const showError = r.status === "failed" && r.lastError;
                   return (
                     <View key={r.id} style={styles.reportRow}>
                       <View style={styles.reportRowHeader}>
@@ -144,11 +180,17 @@ export function SyncStatusPanel({
                         Saved {formatRelativeTime(new Date(r.createdAt))}
                         {gpsAccuracy != null ? ` · GPS ±${Math.round(gpsAccuracy)}m` : ""}
                       </Text>
-                      {r.lastError ? (
+                      {showError ? (
                         <Text style={styles.reportError} numberOfLines={2}>
                           {r.lastError}
                         </Text>
                       ) : null}
+                      {r.status === "failed" && (
+                        <Pressable style={styles.discardButton} onPress={() => discardReport(r)}>
+                          <Feather name="trash-2" size={11} color={theme.destructive} />
+                          <Text style={styles.discardButtonText}>Discard</Text>
+                        </Pressable>
+                      )}
                     </View>
                   );
                 })}
@@ -226,6 +268,15 @@ function createStyles(theme: Palette) {
     reportStatus: { fontSize: 12, fontWeight: "700" },
     reportMeta: { color: theme.mutedForeground, fontSize: 11, marginLeft: 13 },
     reportError: { color: theme.destructive, fontSize: 11, marginLeft: 13, marginTop: 2 },
+    discardButton: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 4,
+      alignSelf: "flex-start",
+      marginLeft: 13,
+      marginTop: 4,
+    },
+    discardButtonText: { color: theme.destructive, fontSize: 11, fontWeight: "600" },
 
     emptyText: {
       color: theme.mutedForeground,

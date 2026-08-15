@@ -4,6 +4,153 @@ A Technician-only companion app to the Fiix web app, built so background
 GPS pings keep flowing while the screen is off or the app is backgrounded —
 something a browser tab fundamentally can't do.
 
+## ⚠️ Real root cause of "Request failed: 500" found — `signPath` NOT NULL violation
+
+Traced from actual Vercel logs this time, not guessed: every mobile
+report submitted **without a signature** was crashing the insert —
+`NeonDbError: null value in column "signPath" of relation "maintain"
+violates not-null constraint`.
+
+`sync-engine.ts` sent `signPath: undefined` when no signature was
+captured — `JSON.stringify` drops `undefined` properties entirely, so
+the field never reached the server at all. Checked
+`features/offline-sync/save-maintenance-report.ts` (web's own equivalent
+offline-save path) and found it already handles this exact case:
+`signPath: signKey ?? "Unsigned"`. `"Unsigned"` turns out to be a real,
+established sentinel checked in at least eight places across the web
+app (PDF report rendering, dashboards, the purge tool) — not something
+invented for this fix. Mobile now sends the same fallback.
+
+**Also fixed on the web side** (separate patch,
+`fiix-web-updates.zip` — supersedes every earlier web patch from this
+conversation, now includes all three combined deltas): `db/schema.ts`
+previously declared `signPath` as plain nullable, which didn't match the
+real NOT NULL constraint already enforced in production — pure
+documentation drift, not a live change. Added a DB-level
+`DEFAULT 'Unsigned'` on top of the existing constraint as defense-in-depth,
+so any future client that forgets this fallback gets the correct
+sentinel automatically instead of a 500.
+
+Your currently-stuck reports should recover on their own — no manual
+discard needed, same as the concurrency-bug fix earlier: they'll retry
+successfully once this update (mobile) and the migration (web) are both
+live.
+
+## ⚠️ Reports stuck permanently "Uploading" — real bug I introduced, three-part fix
+
+Traced directly from the screenshot showing two items "Uploading" at
+once. Root cause: `useOfflineSync()` is now called independently from
+**both** `DashboardScreen` (added recently, for the itinerary's "Queued"
+badges) **and** `MaintenanceListScreen`. With a tab navigator keeping both
+screens mounted at once, that's two fully separate sync loops, each with
+its own mount-time drain — `drainQueue`'s only protection
+(`if (status === "syncing") continue`) is checked once per *call*, not
+shared across calls, so two overlapping calls can each grab a *different*
+pending item and upload both at the same time. That's exactly what two
+simultaneous "Uploading" rows looks like.
+
+Three fixes, addressing this at every layer it could recur:
+
+1. **The actual concurrency bug** (`sync-engine.ts`) — `drainQueue` now
+   has a module-level in-flight guard: any call while a pass is already
+   running returns that same pass instead of starting a second one. Fixes
+   it regardless of how many components ever call the hook, rather than
+   requiring every future caller to coordinate manually.
+2. **No request ever had a timeout** — `fetch()` has none by default.
+   Combined with the bug above, a stalled request (weak connection,
+   unresponsive server) could leave a report showing "Uploading" forever
+   with zero automatic recovery. Both `api.ts`'s shared request function
+   (30s) and the raw R2 upload `fetch` in `sync-engine.ts` (60s, since
+   it's moving an actual file, not a small JSON body) now abort and fail
+   cleanly via `AbortController` instead of hanging indefinitely.
+3. **Recovery for what's stuck right now** — `offline-db.ts` resets any
+   report still showing `syncing` back to `pending` once, at every app
+   startup. Nothing can legitimately still be "in flight" at a fresh
+   start (the in-memory promise that would have resolved it died with the
+   previous session) — without this, an orphaned `syncing` row stays
+   stuck forever, since `drainQueue`'s own skip-if-syncing check means
+   nothing would ever retry it again. **This one fixes your two
+   currently-stuck reports automatically** — no manual discard needed,
+   just get this update running and they'll pick back up on the next
+   sync.
+
+## Sync panel: stale error display fixed, discard added for stuck reports
+
+Two small but real fixes, prompted directly by a screenshot showing an
+"Uploading" item still displaying "Bucket not allowed" text — that text
+was leftover from the attempt *before* the R2 fix, not a sign the
+current (post-fix) attempt was failing too.
+
+- **Stale error hidden while actively retrying.** `lastError` is only
+  ever from a report's most recent *completed* attempt — the panel now
+  only shows it while `status === "failed"`, not during `"syncing"`,
+  so a fresh retry in progress doesn't display an old failure as if it
+  were happening right now. The text isn't cleared from storage, just
+  hidden — it reappears immediately if this attempt fails too.
+- **Discard button** on any failed report — for exactly the case in that
+  screenshot (two items at 47 and 33 attempts respectively, almost
+  certainly stale payloads from testing before several schema fixes
+  landed, not worth continuing to auto-retry forever). Confirms before
+  deleting, explains plainly that it's permanent and the report will
+  never reach the server.
+
+**On the two `Request failed: 500` items specifically** — I don't have
+visibility into the actual server-side exception without real logs
+(Vercel's, not anything client-visible), so I won't guess at a specific
+cause. Given the attempt counts, the more useful path is: discard those
+two, then create a **fresh** test report end-to-end. If a brand new
+report also comes back 500, that's a real, current bug worth pulling
+server logs for — if it succeeds, the old ones were just stale data from
+earlier in this project's testing.
+
+## ⚠️ "Bucket not allowed" — real bug, wrong bucket name since the very first version
+
+Checked `lib/r2.ts` and `features/offline-sync/config.ts` on web directly
+rather than guess again. The actual allowlist
+(`ALLOWED_BUCKETS = new Set([env.bucketName, "fiixdrive", "fiixnozzle"])`)
+never included `"fiix-uploads"` — the name `sync-engine.ts` had hardcoded
+since it was first written, flagged at the time with a comment
+("keep in sync with... if that ever changes") that assumed the name was
+merely subject to *future* drift, when it was actually wrong from the
+start and never verified against the real source.
+
+Worse than just being wrong: it was also a single bucket for both upload
+kinds, when web genuinely uses two different ones —
+`nozzle: "fiixnozzle"`, `signature: "fiixdrive"`. Fixed to match exactly:
+`R2_BUCKETS.nozzle` / `R2_BUCKETS.signature`, selected per upload call
+rather than one shared constant.
+
+**Your existing failed queue items (the ones in your screenshot) don't
+need to be manually cleared or recreated** — `drainQueue` retries every
+non-`syncing` item on every sync attempt regardless of prior failures,
+and the `clientUuid` idempotency key means a retry-after-partial-failure
+is always safe. They should just succeed automatically once this build
+is running.
+
+## Offline itinerary: prevent duplicate Maintenance entries for the same printer
+
+Real gap: the server's `isMaintained` flag only flips once a sync
+actually *completes* — between "saved to the offline queue" and "synced,"
+a schedule detail still looked completely untouched and tappable, so a
+technician offline (or just faster than the sync) could queue a second,
+duplicate report for the same printer.
+
+- **`useOfflineSync`** now tracks which `schedDetailsId`s have a report
+  sitting in the local queue (pending, actively uploading, **or**
+  failed-but-retryable — all three still mean "a report already exists,"
+  not just a clean pending state), and immediately invalidates the
+  schedule + attendance-status queries the moment a sync actually
+  completes — closing the gap where a just-synced printer would keep
+  showing as available until whatever periodic/focus refetch happened to
+  run next.
+- **Dashboard's itinerary** now has three states per printer, not two:
+  tappable (normal) → **Queued** (locally saved, not yet confirmed by the
+  server — dimmed, blocked, clock icon, amber badge) → **Saved**
+  (server-confirmed via `isMaintained` — dimmed, blocked, check icon,
+  green badge, same as before). Tapping a Queued row shows a clear
+  explanation instead of silently doing nothing or letting a duplicate
+  through.
+
 ## Five-part feature batch: signatories, signature canvas, nav bar, offline queue
 
 **Case B** overall — `expo-navigation-bar` is a real native module, so

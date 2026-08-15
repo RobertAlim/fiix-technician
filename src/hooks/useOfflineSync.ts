@@ -12,6 +12,7 @@ import { useEffect, useRef, useState } from "react";
 import { AppState } from "react-native";
 import NetInfo from "@react-native-community/netinfo";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { useQueryClient } from "@tanstack/react-query";
 import { useApi } from "@/hooks/useApi";
 import { drainQueue } from "@/lib/sync-engine";
 import { listQueuedReports, QueuedReport } from "@/lib/offline-db";
@@ -20,6 +21,7 @@ const LAST_SYNC_KEY = "fiix-last-sync-at";
 
 export function useOfflineSync() {
   const api = useApi();
+  const queryClient = useQueryClient();
   const [syncing, setSyncing] = useState(false);
   const [reports, setReports] = useState<QueuedReport[]>([]);
   const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
@@ -38,6 +40,18 @@ export function useOfflineSync() {
         const now = new Date();
         setLastSyncAt(now);
         await AsyncStorage.setItem(LAST_SYNC_KEY, now.toISOString()).catch(() => {});
+        // A successful sync is exactly what flips a schedule detail's
+        // isMaintained flag server-side (via the /api/sched-details link
+        // step in sync-engine.ts) — without this, DashboardScreen's
+        // itinerary would keep showing the just-synced printer as
+        // "Queued" (or worse, tappable again) until whatever periodic/
+        // focus refetch happened to run next, instead of promptly
+        // switching to the real "Already completed" state. Partial keys
+        // match as prefixes in react-query by default, so this catches
+        // ["schedule", technicianId, "today"] without needing to know
+        // the technicianId here.
+        queryClient.invalidateQueries({ queryKey: ["schedule"] });
+        queryClient.invalidateQueries({ queryKey: ["attendance-status"] });
       }
     } finally {
       setSyncing(false);
