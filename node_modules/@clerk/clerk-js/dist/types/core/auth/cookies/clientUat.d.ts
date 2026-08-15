@@ -1,0 +1,15 @@
+import type { ClientResource } from '@clerk/shared/types';
+export type ClientUatCookieHandler = {
+    set: (client: ClientResource | undefined) => void;
+    get: () => number;
+};
+export type ClientUatCookieOptions = {
+    usePartitionedCookies: () => boolean;
+};
+/**
+ * Create a long-lived JS cookie to store the client last updated_at timestamp
+ * for development instances (for production instance is set by FAPI).
+ * The cookie is used as hint from the Clerk Backend packages to identify
+ * if the user is authenticated or not.
+ */
+export declare const createClientUatCookie: (cookieSuffix: string, options: ClientUatCookieOptions) => ClientUatCookieHandler;

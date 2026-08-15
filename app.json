@@ -9,6 +9,13 @@
     "scheme": "fiixtechnician",
     "platforms": ["ios", "android"],
     "newArchEnabled": true,
+    "runtimeVersion": {
+      "policy": "fingerprint"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/b30fc50c-5fb1-4612-9aa6-a20c68819cf5",
+      "enabled": true
+    },
     "splash": {
       "backgroundColor": "#0f172a"
     },
@@ -75,7 +82,7 @@
     ],
     "extra": {
       "eas": {
-        "projectId": "REPLACE_WITH_EAS_PROJECT_ID"
+        "projectId": "b30fc50c-5fb1-4612-9aa6-a20c68819cf5"
       }
     }
   }

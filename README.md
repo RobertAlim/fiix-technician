@@ -4,6 +4,40 @@ A Technician-only companion app to the Fiix web app, built so background
 GPS pings keep flowing while the screen is off or the app is backgrounded —
 something a browser tab fundamentally can't do.
 
+## EAS Update infrastructure — fully configured
+
+Both `projectId` and `updates.url` in `app.json` now hold real values
+(`b30fc50c-5fb1-4612-9aa6-a20c68819cf5`, and the deterministic
+`https://u.expo.dev/<that-id>` URL Expo always uses — no `eas
+update:configure` needed once the ID itself is known, since that URL
+pattern is fixed, not project-specific lookup data).
+
+- `expo-updates` (`~29.0.19`, the real SDK 54 version).
+- `runtimeVersion: { policy: "fingerprint" }` — ties every OTA update to
+  the exact native build it's safe to apply to, computed automatically
+  from the actual compiled native code/config rather than a
+  manually-bumped version number. Matters specifically here given how
+  much native surface this project has already been through (the NDK
+  swap, `expo-font`, `react-native-get-random-values`, the Solana
+  autolinking exclusion) — "fingerprint" detects all of that
+  automatically rather than needing hand-maintenance that would quietly
+  go stale.
+
+**This round of changes (adding `expo-updates` itself) is Case B** — the
+currently-installed APK predates `expo-updates` entirely and has no
+update-checking mechanism at all, so it needs one more manual rebuild +
+install before OTA updates can start working. After that:
+
+```powershell
+npx eas-cli@latest update --branch preview --message "describe the change"
+```
+ships any future Case A (JS-only) change instantly, no rebuild, no
+reinstall — picked up automatically the next time the app cold-starts on
+a device whose native fingerprint matches. A build with a different
+native fingerprint (i.e. after any future Case B change) won't apply a
+mismatched update — that's the fingerprint policy doing its job, not a
+bug if you see it skip.
+
 ## ⚠️ `expo-doctor` finding: missing `expo-font` peer dependency (fixed)
 
 `expo-doctor` correctly flagged this — `@expo/vector-icons` (used for
