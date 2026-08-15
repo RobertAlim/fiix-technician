@@ -1,0 +1,53 @@
+# Expo / CNG (Continuous Native Generation) workflow
+#
+# android/ and ios/ are deliberately NOT committed — this project is fully
+# managed (app.json is the single source of truth for native config).
+# Committing those folders would make EAS Build treat this as a "bare"
+# workflow and skip running `expo prebuild` automatically, which is
+# exactly the "app config fields may not be synced" warning `expo-doctor`
+# flagged: any future change to orientation/icon/scheme/splash/ios/
+# android/plugins in app.json would silently stop taking effect on the
+# next build. Regenerate locally anytime with `npx expo prebuild --clean`
+# — it's cheap and deterministic from app.json, not something to keep
+# around as tracked source.
+/android
+/ios
+
+# Machine-local Expo state (device pairing history, dev server settings)
+# — the other expo-doctor finding. Never useful to another machine or CI,
+# and differs per developer.
+.expo/
+
+# Dependencies
+node_modules/
+
+# Native build artifacts (only relevant if android/ios are ever
+# temporarily present locally — harmless to keep even though the whole
+# folders are already excluded above)
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+
+# Metro / bundler
+.metro-health-check*
+
+# Env files — never commit real secrets. .env.example stays tracked.
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# Logs
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# TypeScript
+*.tsbuildinfo
+
+# EAS
+.eas/

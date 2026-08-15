@@ -34,12 +34,14 @@ import {
   Image,
   Alert,
   ActivityIndicator,
+  Platform,
 } from "react-native";
-import { useRoute, RouteProp, useNavigation } from "@react-navigation/native";
+import { useRoute, RouteProp, useNavigation, useFocusEffect } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import { Feather } from "@expo/vector-icons";
 import * as ImagePicker from "expo-image-picker";
 import * as Location from "expo-location";
+import * as NavigationBar from "expo-navigation-bar";
 import SignatureScreen, { SignatureViewRef } from "react-native-signature-canvas";
 import { v4 as uuidv4 } from "uuid";
 import { useQuery } from "@tanstack/react-query";
@@ -100,6 +102,25 @@ export function MaintenanceFormScreen() {
   const api = useApi();
   const sigRef = React.useRef<SignatureViewRef>(null);
 
+  // Hides Android's system nav bar (back/home/recents) specifically while
+  // this screen is focused, so it can't obscure the Save Maintenance
+  // button — restored automatically the moment the technician navigates
+  // away, via useFocusEffect's cleanup running on blur. `overlay-swipe`
+  // behavior means a technician can still swipe from the bottom edge to
+  // briefly reveal the bar if they genuinely need it (not fully locked
+  // out), rather than the more aggressive `immersive` mode that also
+  // hides the status bar and intercepts swipes.
+  useFocusEffect(
+    React.useCallback(() => {
+      if (Platform.OS !== "android") return;
+      NavigationBar.setVisibilityAsync("hidden").catch(() => {});
+      NavigationBar.setBehaviorAsync("overlay-swipe").catch(() => {});
+      return () => {
+        NavigationBar.setVisibilityAsync("visible").catch(() => {});
+      };
+    }, [])
+  );
+
   const printerQuery = useQuery({
     queryKey: ["printer-lookup", params.serialNo],
     queryFn: () => api.get<PrinterLookupResponse>(`/api/maintain?serialNo=${encodeURIComponent(params.serialNo)}`),
@@ -123,6 +144,16 @@ export function MaintenanceFormScreen() {
   const [notes, setNotes] = useState("");
   const [nozzlePhotoUri, setNozzlePhotoUri] = useState<string | null>(null);
   const [signatureUri, setSignatureUri] = useState<string | null>(null);
+  // Toggled by the signature canvas's own onBegin/onEnd (see below) — the
+  // actual fix for strokes rendering as disconnected dots instead of
+  // continuous lines. The canvas sits inside a ScrollView; without this,
+  // the ScrollView's own pan/scroll gesture responder can steal the touch
+  // mid-stroke (a well-known interaction anywhere a drawing surface is
+  // nested inside a scrollable container), so only touchstart and
+  // touchend ever reach the canvas — visually indistinguishable from a
+  // series of dots. Locking scroll for the exact duration of a stroke is
+  // the standard fix for this class of gesture conflict.
+  const [signatureDrawing, setSignatureDrawing] = useState(false);
 
   // Work Done
   const [headClean, setHeadClean] = useState(false);
@@ -148,6 +179,17 @@ export function MaintenanceFormScreen() {
 
   const [saving, setSaving] = useState(false);
 
+  // New-signatory inline form — POST /api/signatories, scoped to this
+  // exact client+location per the requirement that the same client can
+  // have distinct signatories at different locations, and that duplicate
+  // prevention only fires when BOTH client AND location match (server-side
+  // in app/api/signatories/route.ts — verified against that source, not
+  // assumed, since the original route only scoped duplicates by client).
+  const [showAddSignatory, setShowAddSignatory] = useState(false);
+  const [newSigFirstName, setNewSigFirstName] = useState("");
+  const [newSigLastName, setNewSigLastName] = useState("");
+  const [addingSignatory, setAddingSignatory] = useState(false);
+
   const signatories = printerQuery.data?.signatories ?? [];
 
   useEffect(() => {
@@ -155,6 +197,41 @@ export function MaintenanceFormScreen() {
       setSignatoryId(signatories[0].value);
     }
   }, [printerQuery.data]);
+
+  const submitNewSignatory = async () => {
+    const printer = printerQuery.data?.maintenanceData;
+    if (!printer) return;
+    const firstName = newSigFirstName.trim();
+    const lastName = newSigLastName.trim();
+    if (!firstName || !lastName) {
+      Alert.alert("First and last name are both required.");
+      return;
+    }
+    setAddingSignatory(true);
+    try {
+      const result = await api.post<{ message: string; id: number }>("/api/signatories", {
+        clientId: printer.clientId,
+        locationId: printer.locationId,
+        firstName,
+        lastName,
+      });
+      await printerQuery.refetch();
+      setSignatoryId(String(result.id));
+      setShowAddSignatory(false);
+      setNewSigFirstName("");
+      setNewSigLastName("");
+    } catch (err) {
+      // The route returns 409 specifically for "this exact client+location
+      // already has this signatory" — surfaced with the server's own
+      // message rather than a generic failure, since it's not really an
+      // error so much as "you don't need to add this, it's already here."
+      const message =
+        err instanceof Error ? err.message : "Couldn't add signatory.";
+      Alert.alert("Couldn't add signatory", message);
+    } finally {
+      setAddingSignatory(false);
+    }
+  };
 
   const togglePart = (list: PartRef[], setList: (v: PartRef[]) => void, opt: PartOption) => {
     const exists = list.some((p) => p.partId === opt.value);
@@ -357,7 +434,11 @@ export function MaintenanceFormScreen() {
   );
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={{ padding: 16, gap: 16 }}>
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={{ padding: 16, gap: 16 }}
+      scrollEnabled={!signatureDrawing}
+    >
       <View style={styles.infoCard}>
         <Text style={styles.infoClient}>{printer.client}</Text>
         <Text style={styles.infoLine}>{printer.location}</Text>
@@ -450,11 +531,53 @@ export function MaintenanceFormScreen() {
         })}
       </View>
 
-      <Text style={styles.label}>Signatory (Checked By)</Text>
+      <View style={styles.signatoryHeaderRow}>
+        <Text style={styles.label}>Signatory (Checked By)</Text>
+        <Pressable
+          style={styles.addSignatoryButton}
+          onPress={() => setShowAddSignatory((v) => !v)}
+        >
+          <Feather name={showAddSignatory ? "x" : "plus"} size={14} color={theme.primary} />
+        </Pressable>
+      </View>
+
+      {showAddSignatory && (
+        <View style={styles.addSignatoryBox}>
+          <TextInput
+            style={styles.input}
+            placeholder="First name"
+            placeholderTextColor={theme.mutedForeground}
+            value={newSigFirstName}
+            onChangeText={setNewSigFirstName}
+          />
+          <TextInput
+            style={styles.input}
+            placeholder="Last name"
+            placeholderTextColor={theme.mutedForeground}
+            value={newSigLastName}
+            onChangeText={setNewSigLastName}
+          />
+          <Text style={styles.addSignatoryHint}>
+            Added for {printerQuery.data?.maintenanceData.client} —{" "}
+            {printerQuery.data?.maintenanceData.location} specifically.
+          </Text>
+          <Pressable
+            style={styles.secondaryButton}
+            onPress={submitNewSignatory}
+            disabled={addingSignatory}
+          >
+            {addingSignatory ? (
+              <ActivityIndicator color={theme.foreground} />
+            ) : (
+              <Text style={styles.secondaryButtonText}>Add Signatory</Text>
+            )}
+          </Pressable>
+        </View>
+      )}
+
       {signatories.length === 0 ? (
         <Text style={styles.body}>
-          No signatories on file for this client yet — have an Admin add one before this visit can
-          be completed.
+          No signatories on file for this client and location yet — add one above.
         </Text>
       ) : (
         <View style={styles.chipRow}>
@@ -485,6 +608,8 @@ export function MaintenanceFormScreen() {
         <SignatureScreen
           ref={sigRef}
           onOK={onSignatureOK}
+          onBegin={() => setSignatureDrawing(true)}
+          onEnd={() => setSignatureDrawing(false)}
           descriptionText=""
           webStyle="body,html{background:#fff;}"
         />
@@ -580,6 +705,34 @@ function createStyles(theme: Palette) {
     chipActive: { backgroundColor: theme.primary, borderColor: theme.primary },
     chipText: { color: theme.mutedForeground, fontSize: 13, fontWeight: "600" },
     chipTextActive: { color: theme.primaryForeground },
+
+    signatoryHeaderRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+    addSignatoryButton: {
+      width: 26,
+      height: 26,
+      borderRadius: 13,
+      borderWidth: 1,
+      borderColor: theme.primary,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    addSignatoryBox: {
+      backgroundColor: theme.card,
+      borderWidth: 1,
+      borderColor: theme.border,
+      borderRadius: theme.radius,
+      padding: 12,
+      gap: 8,
+    },
+    addSignatoryHint: { color: theme.mutedForeground, fontSize: 11 },
+    input: {
+      borderWidth: 1,
+      borderColor: theme.border,
+      borderRadius: theme.radius,
+      padding: 10,
+      color: theme.foreground,
+      backgroundColor: theme.background,
+    },
 
     scanChip: {
       flexDirection: "row",

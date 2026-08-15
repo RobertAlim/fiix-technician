@@ -4,6 +4,146 @@ A Technician-only companion app to the Fiix web app, built so background
 GPS pings keep flowing while the screen is off or the app is backgrounded —
 something a browser tab fundamentally can't do.
 
+## Five-part feature batch: signatories, signature canvas, nav bar, offline queue
+
+**Case B** overall — `expo-navigation-bar` is a real native module, so
+this whole batch needs a rebuild even though most of the individual
+changes are pure JS.
+
+### Signature canvas: strokes rendering as dots (fixed)
+
+Real, well-known class of bug: the signature canvas sits inside a
+`ScrollView`, and the ScrollView's own pan/scroll gesture responder was
+intercepting touch-move events mid-stroke — only touchstart and touchend
+ever reached the canvas, which is visually indistinguishable from a
+series of disconnected dots. Fixed by locking `scrollEnabled={false}` for
+the exact duration of a stroke, driven by the canvas's own `onBegin`/
+`onEnd` callbacks (confirmed these are real supported props by checking
+the installed package's own type definitions, not assumed).
+
+### Android nav bar hidden on Maintenance Report (fixed)
+
+New `expo-navigation-bar` dependency (`~5.0.10`, the real SDK 54
+version). Hidden via `useFocusEffect` only while `MaintenanceFormScreen`
+is focused — restored automatically the moment the technician navigates
+away, via the effect's own cleanup running on blur, not a manual toggle
+that could be forgotten. Uses `overlay-swipe` behavior specifically
+(swipe from the bottom edge briefly reveals the bar) rather than full
+immersive mode, so a technician isn't ever completely locked out of the
+system nav if they genuinely need it — only kept out of the way by
+default.
+
+### Signatory "Add" — required a real web-app schema change
+
+Checked `app/api/signatories/route.ts` and `db/schema.ts` before building
+anything, and found a real gap: **the `signatories` table had no
+`locationId` column at all** — duplicate-checking was scoped to client
+only, contradicting "prevent duplicates only when both Client AND
+Location match." Web-side changes (separate patch,
+`signatories-location-web-patch.zip`, same deploy pattern as the GPS
+history patch — copy into place, `npm run db:migrate`, deploy):
+- `signatories.locationId` (nullable — existing rows predate this column
+  and stay valid as client-only signatories)
+- `GET /api/signatories` now takes an optional `locationId` and scopes
+  results to that exact client+location pair (falling back to include
+  client-only legacy rows regardless of location)
+- `POST /api/signatories`'s duplicate check now compares
+  `(firstName, lastName, clientId, locationId)` instead of just the first
+  three, and returns the new signatory's `id` in the response — needed so
+  the mobile app can auto-select it immediately rather than fragile
+  name-matching against a refetched list
+
+Mobile side: a "+" button next to the signatory picker opens an inline
+first/last-name form, POSTs scoped to the exact printer's client+location,
+and surfaces the server's real duplicate message on a 409 rather than a
+generic failure.
+
+### Offline queue — rebuilt to match web, and this is what actually fixes your reported "Save Maintenance Error"
+
+New `SyncStatusPanel` component mirrors `components/SyncStatusIndicator.tsx`
+field-for-field: status chip (dot + icon + label + pending-count badge),
+a panel with Connection / Pending reports · Queued uploads / Last
+successful sync, a manual "Sync now", and — the actual missing piece —
+**every queued report now shows its real `lastError` text**, not just
+"failed (3 attempts)" with nothing explaining why.
+
+**Important honesty note:** I have not seen what that specific failed
+report's actual error message says — the screenshot only showed the
+generic "failed (3 attempts)" the old UI was limited to. This change
+makes that error visible; it doesn't itself diagnose or fix whatever
+that specific failure was. **Please check the panel again and send me
+the `lastError` text it shows for that report** — that's the concrete
+next step to actually resolve it, rather than guessing blindly at a
+cause I can't currently see.
+
+Mobile's status model (`pending` / `syncing` / `failed`) is coarser than
+web's richer enum (which also tracks `uploading-images` vs
+`uploading-signature` vs `uploading-report` as distinct phases) — matching
+that finer breakdown would mean instrumenting `sync-engine.ts` to report
+progress mid-attempt, not done here. The three states mobile does track
+are the ones that actually change what a technician needs to do about a
+report.
+
+`useOfflineSync` also gained a real `lastSyncAt` (persisted via
+AsyncStorage, survives app restarts) and a lightweight 3s poll of the
+local SQLite queue purely to keep the panel's counts/list visually live
+while open — separate from the actual sync-trigger logic (connectivity
+transitions + app foreground), which is unchanged.
+
+## ⚠️ Black screen on every device — found and fixed a real startup bug
+
+Reported as: successful EAS build, installs fine, opens to a black
+screen — reproducible on a real phone, a second real phone, AND the
+emulator. That consistency across every device (not just one) was the
+key clue: this pointed at the build itself, not a device quirk.
+
+**The actual bug**, found in `App.tsx`:
+```ts
+if (!CLERK_PUBLISHABLE_KEY) {
+  console.error(...);   // only logs
+}
+return <ClerkProvider publishableKey={CLERK_PUBLISHABLE_KEY} ...>  // mounts anyway, even if empty
+```
+If `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY` isn't actually available to the
+**cloud** build — a very common EAS gotcha, since a local `.env` file is
+**not** automatically uploaded to EAS's build servers — this mounts
+`ClerkProvider` with an empty string. Clerk's SDK validates the key
+immediately and throws/hangs on an empty one. In a release/preview build
+(unlike dev-client testing) there's no red-box error screen to show that
+— an uncaught startup error just renders nothing, which is exactly what
+"black screen, every device" looks like from the outside.
+
+**Two fixes, both needed:**
+1. **`src/components/RootErrorBoundary.tsx`** (new) — wraps the whole app.
+   Any future startup crash now shows the actual error message and stack
+   on-screen (hardcoded colors, deliberately not using the app's theme
+   system, since it has to render even if the crash happened inside
+   `ThemeProvider` itself) instead of silently going black. This is the
+   permanent fix — the next time something like this happens, it'll be
+   immediately diagnosable instead of another round of "which of five
+   things could this be."
+2. **`App.tsx`** — the missing-key check now actually stops before
+   mounting `ClerkProvider`, showing a clear "Configuration Missing"
+   screen naming the exact env var and pointing at the real fix
+   (`eas env:create`) instead of proceeding anyway.
+
+**This doesn't fix the root cause by itself** — only makes it visible.
+**You still need to actually register the env vars for EAS cloud builds:**
+```powershell
+npx eas-cli@latest env:create
+```
+(prompts for name/value/environment — do this for both
+`EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY` and `EXPO_PUBLIC_FIIX_API_BASE_URL`,
+for whichever environment matches your `preview` build profile), **then
+rebuild.**
+
+**This one specific fix needs a full rebuild, not `eas update`** — even
+though the change itself is pure JS (normally Case A), the crash this
+fixes happens early enough in startup that it's plausible `expo-updates`
+never gets a chance to check for/apply an OTA update before hitting it.
+Ship this one as a real build to be certain it actually lands, then go
+back to `eas update` for the next genuinely JS-only change after this.
+
 ## EAS Update infrastructure — fully configured
 
 Both `projectId` and `updates.url` in `app.json` now hold real values

@@ -2,17 +2,25 @@
 //
 // Mirrors the entry point of components/pages/Maintenance.tsx. Only
 // reachable while on duty — AppTabs blocks the tab press otherwise.
-import React, { useState, useEffect } from "react";
-import { View, Text, TextInput, Pressable, FlatList, StyleSheet, ActivityIndicator } from "react-native";
+//
+// The offline queue section now uses SyncStatusPanel — the previous bare
+// list only ever showed "failed (3 attempts)" with no way to see WHY,
+// which made a genuinely failed report undiagnosable from the UI alone.
+// The new panel mirrors web's SyncStatusIndicator.tsx field-for-field:
+// connection state, pending/queued counts, last successful sync time, a
+// manual "Sync now", and the real lastError text per failed report.
+import React, { useState } from "react";
+import { View, Text, TextInput, Pressable, StyleSheet, ActivityIndicator } from "react-native";
 import { Feather } from "@expo/vector-icons";
 import { useNavigation } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import { useApi } from "@/hooks/useApi";
-import { listQueuedReports, QueuedReport } from "@/lib/offline-db";
+import { useOfflineSync } from "@/hooks/useOfflineSync";
 import { onNextScan } from "@/lib/scan-bridge";
 import { useAppTheme } from "@/theme";
 import { Palette } from "@/theme/palettes";
 import { RootStackParamList } from "@/navigation/RootNavigator";
+import { SyncStatusPanel } from "@/components/SyncStatusPanel";
 
 // Matches the REAL GET /api/maintain?serialNo= response (verified against
 // app/api/maintain/route.ts directly after a crash report — an earlier
@@ -34,15 +42,7 @@ export function MaintenanceListScreen() {
   const [serialNo, setSerialNo] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [queued, setQueued] = useState<QueuedReport[]>([]);
-
-  useEffect(() => {
-    listQueuedReports().then(setQueued);
-    const unsub = navigation.addListener("focus", () => {
-      listQueuedReports().then(setQueued);
-    });
-    return unsub;
-  }, [navigation]);
+  const sync = useOfflineSync();
 
   const lookupAndOpen = async () => {
     if (!serialNo.trim()) return;
@@ -66,12 +66,20 @@ export function MaintenanceListScreen() {
     }
   };
 
-  const statusColor = (status: QueuedReport["status"]) =>
-    status === "failed" ? theme.destructive : status === "syncing" ? theme.info : theme.warning;
-
   return (
     <View style={styles.container}>
-      <Text style={styles.sectionTitle}>Start a maintenance report</Text>
+      <View style={styles.headerRow}>
+        <Text style={styles.sectionTitle}>Start a maintenance report</Text>
+        <SyncStatusPanel
+          reports={sync.reports}
+          pendingCount={sync.pendingCount}
+          failedCount={sync.failedCount}
+          lastSyncAt={sync.lastSyncAt}
+          online={sync.online}
+          syncing={sync.syncing}
+          onSyncNow={sync.runDrain}
+        />
+      </View>
       <View style={styles.row}>
         <TextInput
           style={styles.input}
@@ -99,23 +107,6 @@ export function MaintenanceListScreen() {
           <Text style={styles.buttonText}>Look Up</Text>
         )}
       </Pressable>
-
-      <Text style={[styles.sectionTitle, { marginTop: 28 }]}>Queued offline ({queued.length})</Text>
-      <FlatList
-        data={queued}
-        keyExtractor={(item) => item.id}
-        contentContainerStyle={{ gap: 8 }}
-        ListEmptyComponent={<Text style={styles.body}>Nothing queued.</Text>}
-        renderItem={({ item }) => (
-          <View style={styles.queuedRow}>
-            <View style={[styles.statusDot, { backgroundColor: statusColor(item.status) }]} />
-            <Text style={styles.body}>
-              {item.id.slice(0, 8)} — {item.status}
-              {item.status === "failed" ? ` (${item.attempts} attempt${item.attempts === 1 ? "" : "s"})` : ""}
-            </Text>
-          </View>
-        )}
-      />
     </View>
   );
 }
@@ -123,7 +114,8 @@ export function MaintenanceListScreen() {
 function createStyles(theme: Palette) {
   return StyleSheet.create({
     container: { flex: 1, padding: 16, backgroundColor: theme.background },
-    sectionTitle: { fontSize: 13, fontWeight: "700", color: theme.mutedForeground, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 },
+    headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 8 },
+    sectionTitle: { fontSize: 13, fontWeight: "700", color: theme.mutedForeground, textTransform: "uppercase", letterSpacing: 0.5 },
     row: { flexDirection: "row", gap: 8, alignItems: "center", marginBottom: 12 },
     input: {
       flex: 1,
@@ -151,17 +143,5 @@ function createStyles(theme: Palette) {
     },
     buttonText: { color: theme.primaryForeground, fontWeight: "700", fontSize: 16 },
     error: { color: theme.destructive, marginBottom: 8 },
-    body: { color: theme.mutedForeground },
-    queuedRow: {
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 10,
-      backgroundColor: theme.card,
-      borderRadius: theme.radius,
-      borderWidth: 1,
-      borderColor: theme.border,
-      padding: 12,
-    },
-    statusDot: { width: 8, height: 8, borderRadius: 4 },
   });
 }
