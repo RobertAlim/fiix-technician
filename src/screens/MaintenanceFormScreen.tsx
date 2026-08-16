@@ -50,8 +50,9 @@ import { toByteArray } from "base64-js";
 
 import { useApi } from "@/hooks/useApi";
 import { enqueueReport } from "@/lib/offline-db";
-import { optimizeNozzlePhoto, optimizeSignature } from "@/lib/image-processing";
+import { optimizeSignature } from "@/lib/image-processing";
 import { onNextScan } from "@/lib/scan-bridge";
+import { onNextCrop } from "@/lib/crop-bridge";
 import { useAppTheme } from "@/theme";
 import { Palette } from "@/theme/palettes";
 import { RootStackParamList } from "@/navigation/RootNavigator";
@@ -245,10 +246,17 @@ export function MaintenanceFormScreen() {
       Alert.alert("Camera permission required");
       return;
     }
-    const result = await ImagePicker.launchCameraAsync({ quality: 0.7 });
+    // Full-resolution raw capture, uncropped/unoptimized — CropImageScreen
+    // is where the technician selects just the relevant nozzle-check
+    // portion, and src/lib/image-processing.ts's
+    // cropAndOptimizeNozzlePhoto() (called from there) is what actually
+    // resizes/compresses to match the web app's real output. onNextCrop
+    // registers this screen's one-shot callback before navigating, same
+    // pattern as scanReplacementUnit()/onNextScan below.
+    const result = await ImagePicker.launchCameraAsync({ quality: 1 });
     if (!result.canceled && result.assets[0]) {
-      const optimizedUri = await optimizeNozzlePhoto(result.assets[0].uri);
-      setNozzlePhotoUri(optimizedUri);
+      onNextCrop((croppedUri) => setNozzlePhotoUri(croppedUri));
+      navigation.navigate("CropImage", { uri: result.assets[0].uri });
     }
   };
 

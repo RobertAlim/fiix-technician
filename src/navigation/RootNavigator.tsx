@@ -23,6 +23,7 @@ import { UnsupportedRoleScreen } from "@/screens/UnsupportedRoleScreen";
 import { AppTabs } from "@/navigation/AppTabs";
 import { MaintenanceFormScreen } from "@/screens/MaintenanceFormScreen";
 import { ScanQRScreen } from "@/screens/ScanQRScreen";
+import { CropImageScreen } from "@/screens/CropImageScreen";
 
 export type RootStackParamList = {
   AppTabs: undefined;
@@ -37,6 +38,11 @@ export type RootStackParamList = {
   // mirroring features/offline-sync/sync-engine.ts's step 4 on web.
   MaintenanceForm: { serialNo: string; schedDetailsId?: number; originMTId?: number };
   ScanQR: { callingPage?: string } | undefined;
+  // Raw camera output only — the finished cropped/optimized uri comes
+  // back through crop-bridge.ts's one-shot callback (same pattern as
+  // ScanQR/scan-bridge.ts), not a param, since there's no built-in way
+  // for a popped screen to hand a value back up the stack.
+  CropImage: { uri: string };
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -143,6 +149,11 @@ export function RootNavigator() {
         options={{ title: "Maintenance Report" }}
       />
       <Stack.Screen name="ScanQR" component={ScanQRScreen} options={{ title: "Scan QR" }} />
+      <Stack.Screen
+        name="CropImage"
+        component={CropImageScreen}
+        options={{ title: "Crop Photo", presentation: "modal" }}
+      />
     </Stack.Navigator>
   );
 }
