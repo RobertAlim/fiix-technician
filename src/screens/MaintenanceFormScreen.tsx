@@ -83,6 +83,14 @@ interface MaintenanceData {
   location: string;
   departmentId: number;
   department: string;
+  // ⚠️ ASSUMED CONTRACT, not confirmed against the real web source (see
+  // the response for what this needs on the backend side): the latest
+  // print count on file for this printer, out of whatever history
+  // GET /api/maintain?serialNo= ends up deriving it from — null when
+  // there's no prior recorded reading yet, in which case any print
+  // count value is accepted. Used by validate() below to block a lower
+  // value than what's already on record.
+  lastPrintCount?: number | null;
 }
 interface PrinterLookupResponse {
   maintenanceData: MaintenanceData;
@@ -144,6 +152,12 @@ export function MaintenanceFormScreen() {
   const [statusId, setStatusId] = useState<string | null>(null);
   const [signatoryId, setSignatoryId] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
+  // Digits only, no commas — the comma-formatted display is derived from
+  // this at render time (see printCountDisplay below), same reasoning as
+  // keeping raw/derived state separate anywhere else in this file rather
+  // than trying to parse commas back out of a formatted string on every
+  // keystroke.
+  const [printCount, setPrintCount] = useState("");
   const [nozzlePhotoUri, setNozzlePhotoUri] = useState<string | null>(null);
   const [signatureUri, setSignatureUri] = useState<string | null>(null);
   // Toggled by the signature canvas's own onBegin/onEnd (see below) — the
@@ -269,6 +283,16 @@ export function MaintenanceFormScreen() {
     setSignatureUri(base64);
   };
 
+  const printCountDisplay = printCount ? Number(printCount).toLocaleString("en-US") : "";
+  const onChangePrintCount = (text: string) => {
+    // Strip everything but digits — this is what actually enforces
+    // "whole numbers only, no decimals or non-numeric values", not the
+    // keyboardType alone (number-pad still lets some devices/IMEs insert
+    // a decimal separator or paste arbitrary text in).
+    setPrintCount(text.replace(/[^0-9]/g, ""));
+  };
+  const lastPrintCount = printerQuery.data?.maintenanceData.lastPrintCount ?? null;
+
   // Mirrors validation/maintainSchema.ts's .refine() chain exactly — same
   // rules, same order, same messages where reasonable — rather than only
   // relying on the server to reject an incomplete submission after it's
@@ -276,6 +300,10 @@ export function MaintenanceFormScreen() {
   const validate = (): string | null => {
     if (!statusId) return "Status is required.";
     if (!signatoryId) return "Signatory is required.";
+    if (!printCount) return "Print count is required.";
+    if (lastPrintCount != null && Number(printCount) < lastPrintCount) {
+      return `Print count can't be lower than the last recorded value (${lastPrintCount.toLocaleString("en-US")}).`;
+    }
     if (!nozzlePhotoUri) return "A nozzle check photo is required.";
     // maintain.signPath is NOT NULL in the actual database schema — found
     // this the hard way via a Vercel log showing a real Postgres
@@ -336,6 +364,10 @@ export function MaintenanceFormScreen() {
         userId: userStatusQuery.data.id,
         signatoryId: Number(signatoryId),
         notes,
+        // ⚠️ ASSUMED field name — see MaintenanceData.lastPrintCount's
+        // comment above and the response for what /api/maintain needs to
+        // accept/persist this correctly server-side.
+        printCount: Number(printCount),
         headClean,
         inkFlush,
         cleanPrinter,
@@ -558,6 +590,21 @@ export function MaintenanceFormScreen() {
         placeholder="Optional notes"
         placeholderTextColor={theme.mutedForeground}
       />
+
+      <Text style={styles.label}>Print Count</Text>
+      <TextInput
+        style={styles.printCountInput}
+        value={printCountDisplay}
+        onChangeText={onChangePrintCount}
+        keyboardType="number-pad"
+        placeholder="0"
+        placeholderTextColor={theme.mutedForeground}
+      />
+      {lastPrintCount != null && (
+        <Text style={styles.printCountHint}>
+          Last recorded: {lastPrintCount.toLocaleString("en-US")}
+        </Text>
+      )}
 
       <Text style={styles.label}>Status</Text>
       <View style={styles.chipRow}>
@@ -848,13 +895,31 @@ function createStyles(theme: Palette) {
       justifyContent: "center",
     },
     secondaryButtonText: { color: theme.foreground, fontWeight: "600" },
+    // Shared with primaryButton below (Save Maintenance) — an explicit
+    // height on both, rather than matching paddingVertical alone, is
+    // what actually guarantees "same width and height as the Save
+    // Maintenance button" regardless of the print count field's much
+    // larger font size changing its natural line height.
     primaryButton: {
       backgroundColor: theme.primary,
       borderRadius: theme.radius,
-      paddingVertical: 14,
+      height: 56,
       alignItems: "center",
       justifyContent: "center",
     },
     primaryButtonText: { color: theme.primaryForeground, fontWeight: "700", fontSize: 16 },
+    printCountInput: {
+      height: 56,
+      borderWidth: 1,
+      borderColor: theme.border,
+      borderRadius: theme.radius,
+      backgroundColor: theme.card,
+      paddingHorizontal: 16,
+      color: theme.foreground,
+      fontSize: 30,
+      fontWeight: "800",
+      textAlignVertical: "center",
+    },
+    printCountHint: { color: theme.mutedForeground, fontSize: 12, marginTop: 4 },
   });
 }

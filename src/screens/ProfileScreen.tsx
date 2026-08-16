@@ -2,7 +2,11 @@
 //
 // Mirrors app/(root)/profile: view + edit the caller's own row. Uses
 // PUT /api/profile — matches the route exactly (firstName/lastName/
-// middleName/contactNo/email only, not birthday).
+// middleName/contactNo/email only, not birthday). contactNo/email are
+// shown but read-only (see the two locked fields below) — the route
+// itself still requires both in the body, so those two are always
+// resubmitted with their existing server value, never anything typed on
+// this screen (moot anyway, since their inputs aren't editable).
 //
 // Also hosts the theme toggle (Light / Dark / System) — the web app has
 // no per-user theme setting to mirror (it just follows the OS/browser),
@@ -50,22 +54,31 @@ export function ProfileScreen() {
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
   const [middleName, setMiddleName] = useState("");
-  const [contactNo, setContactNo] = useState("");
-  const [email, setEmail] = useState("");
 
   useEffect(() => {
     if (profileQuery.data) {
       setFirstName(profileQuery.data.firstName);
       setLastName(profileQuery.data.lastName);
       setMiddleName(profileQuery.data.middleName ?? "");
-      setContactNo(profileQuery.data.contactNo ?? "");
-      setEmail(profileQuery.data.email);
     }
   }, [profileQuery.data]);
 
   const saveMutation = useMutation({
+    // contactNo/email are deliberately read straight from profileQuery.data
+    // here, NOT from any local editable state — see the read-only fields
+    // below. PUT /api/profile still requires both in the body (it's the
+    // same route the web app's editable profile form posts to), so this
+    // resubmits them unchanged rather than omitting them, which keeps
+    // this request valid without ever letting what's typed on this screen
+    // affect either field.
     mutationFn: () =>
-      api.put("/api/profile", { firstName, lastName, middleName, contactNo, email }),
+      api.put("/api/profile", {
+        firstName,
+        lastName,
+        middleName,
+        contactNo: profileQuery.data?.contactNo ?? "",
+        email: profileQuery.data?.email ?? "",
+      }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["user-status"] }),
   });
 
@@ -109,24 +122,31 @@ export function ProfileScreen() {
       <Text style={styles.label}>Middle name</Text>
       <TextInput style={styles.input} value={middleName} onChangeText={setMiddleName} placeholderTextColor={theme.mutedForeground} />
 
-      <Text style={styles.label}>Contact number</Text>
+      <View style={styles.lockedLabelRow}>
+        <Text style={[styles.label, { marginTop: 0 }]}>Contact number</Text>
+        <Feather name="lock" size={11} color={theme.mutedForeground} />
+      </View>
       <TextInput
-        style={styles.input}
-        value={contactNo}
-        onChangeText={setContactNo}
+        style={[styles.input, styles.inputLocked]}
+        value={profileQuery.data?.contactNo ?? ""}
+        editable={false}
         keyboardType="phone-pad"
         placeholderTextColor={theme.mutedForeground}
       />
 
-      <Text style={styles.label}>Email</Text>
+      <View style={styles.lockedLabelRow}>
+        <Text style={[styles.label, { marginTop: 0 }]}>Email</Text>
+        <Feather name="lock" size={11} color={theme.mutedForeground} />
+      </View>
       <TextInput
-        style={styles.input}
-        value={email}
-        onChangeText={setEmail}
+        style={[styles.input, styles.inputLocked]}
+        value={profileQuery.data?.email ?? ""}
+        editable={false}
         autoCapitalize="none"
         keyboardType="email-address"
         placeholderTextColor={theme.mutedForeground}
       />
+      <Text style={styles.lockedHint}>Contact an Admin to update your contact number or email.</Text>
 
       <View style={styles.rolePill}>
         <Text style={styles.rolePillText}>{profileQuery.data?.role ?? "—"}</Text>
@@ -182,6 +202,9 @@ function createStyles(theme: Palette) {
       color: theme.foreground,
       backgroundColor: theme.card,
     },
+    lockedLabelRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 12 },
+    inputLocked: { backgroundColor: theme.muted, color: theme.mutedForeground, marginTop: 4 },
+    lockedHint: { color: theme.mutedForeground, fontSize: 11, marginTop: 4 },
     rolePill: {
       alignSelf: "flex-start",
       backgroundColor: theme.accent,

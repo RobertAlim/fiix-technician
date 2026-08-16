@@ -17,7 +17,7 @@
 // but the app should surface a clear timeout/error instead of hanging
 // silently regardless of the cause, which is what this version does.
 import React, { useEffect, useRef, useState } from "react";
-import { View, Text, Pressable, StyleSheet, FlatList, ActivityIndicator, Alert, ScrollView, Linking, Modal } from "react-native";
+import { View, Text, Pressable, StyleSheet, FlatList, ActivityIndicator, Alert, ScrollView, Linking, Modal, TextInput } from "react-native";
 import * as Location from "expo-location";
 import { Feather } from "@expo/vector-icons";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -163,6 +163,17 @@ export function DashboardScreen() {
   const [gpsBackgroundActive, setGpsBackgroundActive] = useState(false);
   const [locationState, setLocationState] = useState<LocationState>({ kind: "checking" });
   const [showLocationDisclosure, setShowLocationDisclosure] = useState(false);
+  // Time Out confirmation — see the dialog itself further down for why
+  // this is a typed-word gate rather than a plain Cancel/Confirm: Time
+  // Out is destructive-ish (locks the whole Dashboard until the next
+  // scheduled day, per hasTimedOutToday above) and sits right below the
+  // itinerary list, an easy mis-tap target.
+  const [showTimeOutConfirm, setShowTimeOutConfirm] = useState(false);
+  const [timeOutConfirmText, setTimeOutConfirmText] = useState("");
+  const closeTimeOutConfirm = () => {
+    setShowTimeOutConfirm(false);
+    setTimeOutConfirmText("");
+  };
   const watchSubRef = useRef<Location.LocationSubscription | null>(null);
 
   const statusQuery = useQuery({
@@ -416,7 +427,10 @@ export function DashboardScreen() {
     // than kept "just in case"; the SMS notification this triggers
     // server-side already works correctly without it.
     mutationFn: () => api.post("/api/attendance/time-out"),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["attendance-status"] }),
+    onSuccess: () => {
+      closeTimeOutConfirm();
+      queryClient.invalidateQueries({ queryKey: ["attendance-status"] });
+    },
     onError: (err) => Alert.alert("Time Out failed", err instanceof Error ? err.message : String(err)),
   });
 
@@ -815,7 +829,7 @@ export function DashboardScreen() {
       )}
       <Pressable
         style={[styles.primaryButton, styles.timeOutButton]}
-        onPress={() => timeOutMutation.mutate()}
+        onPress={() => setShowTimeOutConfirm(true)}
         disabled={timeOutMutation.isPending}
       >
         {timeOutMutation.isPending ? (
@@ -824,6 +838,60 @@ export function DashboardScreen() {
           <Text style={[styles.primaryButtonText, { color: "#fff" }]}>Time Out</Text>
         )}
       </Pressable>
+
+      {/* Matches the design you sent: title + close X top-right, plain
+          body copy, Cancel / destructive-action pills bottom-right. The
+          typed-OUT gate below is the one addition beyond that reference —
+          Time Out has no undo (it locks the whole Dashboard until the
+          next scheduled day), so a plain two-button confirm is one
+          mis-tap away from the same accidental action the confirmation
+          exists to prevent. */}
+      <Modal visible={showTimeOutConfirm} transparent animationType="fade" onRequestClose={closeTimeOutConfirm}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.confirmCard}>
+            <View style={styles.confirmHeaderRow}>
+              <Text style={styles.confirmTitle}>End your shift?</Text>
+              <Pressable onPress={closeTimeOutConfirm} hitSlop={10}>
+                <Feather name="x" size={20} color={theme.mutedForeground} />
+              </Pressable>
+            </View>
+            <Text style={styles.confirmBody}>
+              This records your Time Out and locks the dashboard until your next scheduled Time In.
+            </Text>
+            <Text style={styles.confirmInputLabel}>Type OUT to confirm</Text>
+            <TextInput
+              style={styles.confirmInput}
+              value={timeOutConfirmText}
+              onChangeText={setTimeOutConfirmText}
+              placeholder="OUT"
+              placeholderTextColor={theme.mutedForeground}
+              autoCapitalize="characters"
+              autoCorrect={false}
+              autoComplete="off"
+            />
+            <View style={styles.confirmButtonRow}>
+              <Pressable style={styles.confirmCancelButton} onPress={closeTimeOutConfirm}>
+                <Text style={styles.confirmCancelText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                style={[
+                  styles.confirmTimeOutButton,
+                  (timeOutConfirmText.trim().toUpperCase() !== "OUT" || timeOutMutation.isPending) &&
+                    styles.confirmTimeOutButtonDisabled,
+                ]}
+                disabled={timeOutConfirmText.trim().toUpperCase() !== "OUT" || timeOutMutation.isPending}
+                onPress={() => timeOutMutation.mutate()}
+              >
+                {timeOutMutation.isPending ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <Text style={styles.confirmTimeOutText}>Time Out</Text>
+                )}
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -1070,5 +1138,49 @@ function createStyles(theme: Palette) {
     modalNoticeText: { flex: 1, color: theme.foreground, fontSize: 12, lineHeight: 17 },
     modalDismiss: { marginTop: 4, padding: 8 },
     modalDismissText: { color: theme.mutedForeground, fontSize: 13, fontWeight: "600" },
+
+    confirmCard: {
+      width: "100%",
+      maxWidth: 420,
+      backgroundColor: theme.card,
+      borderRadius: theme.radius,
+      borderWidth: 1,
+      borderColor: theme.border,
+      padding: 20,
+      gap: 12,
+    },
+    confirmHeaderRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+    confirmTitle: { fontSize: 19, fontWeight: "800", color: theme.foreground },
+    confirmBody: { color: theme.mutedForeground, fontSize: 14, lineHeight: 20 },
+    confirmInputLabel: { color: theme.mutedForeground, fontSize: 12, fontWeight: "700", marginTop: 2 },
+    confirmInput: {
+      borderWidth: 1,
+      borderColor: theme.border,
+      borderRadius: 12,
+      paddingHorizontal: 14,
+      paddingVertical: 10,
+      fontSize: 16,
+      fontWeight: "700",
+      color: theme.foreground,
+      backgroundColor: theme.background,
+    },
+    confirmButtonRow: { flexDirection: "row", justifyContent: "flex-end", gap: 10, marginTop: 4 },
+    confirmCancelButton: {
+      paddingHorizontal: 20,
+      paddingVertical: 12,
+      borderRadius: 999,
+      borderWidth: 1,
+      borderColor: theme.border,
+      backgroundColor: theme.card,
+    },
+    confirmCancelText: { color: theme.foreground, fontWeight: "700" },
+    confirmTimeOutButton: {
+      paddingHorizontal: 22,
+      paddingVertical: 12,
+      borderRadius: 999,
+      backgroundColor: theme.destructive,
+    },
+    confirmTimeOutButtonDisabled: { opacity: 0.4 },
+    confirmTimeOutText: { color: "#fff", fontWeight: "700" },
   });
 }
