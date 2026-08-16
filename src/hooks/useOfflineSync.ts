@@ -3,11 +3,15 @@
 // Mirrors features/offline-sync/use-offline-sync.ts's triggers: sync
 // whenever connectivity comes back, and once on mount/foreground in case
 // something was queued last session and the app cold-started already
-// online. No polling for the SYNC TRIGGER — connectivity transitions
-// drive that, same as web. There IS a light poll of the local queue
-// itself (see below), which is a different thing: it's what keeps the
-// new Synchronization panel's report list/counts visually live while
-// open, not what decides when to attempt a sync.
+// online. On top of that (mobile-specific addition, not mirrored from
+// web): a periodic retry while online AND something is actually
+// pending/failed — see the interval below — so a report that failed mid-
+// upload gets retried automatically without needing another connectivity
+// transition or app-foreground event to trigger it. There IS a separate,
+// faster light poll of the local queue itself (see below), which is a
+// different thing: it's what keeps the Synchronization panel's report
+// list/counts visually live while open, not what decides when to attempt
+// a sync.
 import { useEffect, useRef, useState } from "react";
 import { AppState } from "react-native";
 import NetInfo from "@react-native-community/netinfo";
@@ -27,6 +31,11 @@ export function useOfflineSync() {
   const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
   const [online, setOnline] = useState(true);
   const wasOffline = useRef(false);
+  // Read inside the periodic retry interval below — that interval is set
+  // up once (empty dep array on the main effect), so it needs a ref
+  // rather than the `online` state value directly to see up-to-date
+  // connectivity on every tick without re-creating the interval itself.
+  const onlineRef = useRef(true);
 
   const refreshReports = async () => {
     setReports(await listQueuedReports());
@@ -69,6 +78,7 @@ export function useOfflineSync() {
     const netSub = NetInfo.addEventListener((state) => {
       const isOnline = !!state.isConnected && state.isInternetReachable !== false;
       setOnline(isOnline);
+      onlineRef.current = isOnline;
       if (isOnline && wasOffline.current) runDrain();
       wasOffline.current = !isOnline;
     });
@@ -76,6 +86,26 @@ export function useOfflineSync() {
     const appSub = AppState.addEventListener("change", (nextState) => {
       if (nextState === "active") runDrain();
     });
+
+    // Continuous background retry — the actual fix for "technician
+    // shouldn't need to tap Sync": the two triggers above only fire on an
+    // offline→online EDGE or an app-foreground EVENT, so a report that
+    // failed mid-upload (bad request, printer since deleted, a transient
+    // 5xx — anything that isn't itself a connectivity change) would
+    // otherwise just sit "failed" until one of those edges happens to
+    // occur again. This tick doesn't need its own pending/failed check:
+    // runDrain() → drainQueue() reads the (usually near-empty) local
+    // queue and is a no-op cost when there's nothing to send, so it's
+    // safe to call unconditionally on a schedule. Guarded on onlineRef
+    // rather than attempting-and-letting-it-fail while offline, purely to
+    // avoid a pointless request-timeout wait every 20s on a device that's
+    // genuinely offline. Multiple mounted hook instances (Dashboard +
+    // MaintenanceList) each run this same interval — safe, since
+    // drainQueue()'s module-level activeDrain mutex (sync-engine.ts)
+    // collapses concurrent calls into the one actually-running pass.
+    const retryId = setInterval(() => {
+      if (onlineRef.current) runDrain();
+    }, 20_000);
 
     // Light poll purely to keep the report list/counts visually
     // up to date (e.g. while the Synchronization panel is open and a
@@ -86,6 +116,7 @@ export function useOfflineSync() {
     return () => {
       netSub();
       appSub.remove();
+      clearInterval(retryId);
       clearInterval(pollId);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -44,14 +44,13 @@ import * as Location from "expo-location";
 import * as NavigationBar from "expo-navigation-bar";
 import SignatureScreen, { SignatureViewRef } from "react-native-signature-canvas";
 import { v4 as uuidv4 } from "uuid";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import NetInfo from "@react-native-community/netinfo";
+import { useQuery } from "@tanstack/react-query";
 import { File, Paths } from "expo-file-system";
 import { toByteArray } from "base64-js";
 
 import { useApi } from "@/hooks/useApi";
 import { enqueueReport } from "@/lib/offline-db";
-import { submitReport } from "@/lib/sync-engine";
+import { optimizeNozzlePhoto, optimizeSignature } from "@/lib/image-processing";
 import { onNextScan } from "@/lib/scan-bridge";
 import { useAppTheme } from "@/theme";
 import { Palette } from "@/theme/palettes";
@@ -102,7 +101,6 @@ export function MaintenanceFormScreen() {
   const { params } = useRoute<FormRoute>();
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
   const api = useApi();
-  const queryClient = useQueryClient();
   const sigRef = React.useRef<SignatureViewRef>(null);
 
   // Hides Android's system nav bar (back/home/recents) specifically while
@@ -249,7 +247,8 @@ export function MaintenanceFormScreen() {
     }
     const result = await ImagePicker.launchCameraAsync({ quality: 0.7 });
     if (!result.canceled && result.assets[0]) {
-      setNozzlePhotoUri(result.assets[0].uri);
+      const optimizedUri = await optimizeNozzlePhoto(result.assets[0].uri);
+      setNozzlePhotoUri(optimizedUri);
     }
   };
 
@@ -290,29 +289,9 @@ export function MaintenanceFormScreen() {
     return null;
   };
 
-  // Save Maintenance: online-first, offline-queue-as-fallback.
-  //
-  // The previous version of this screen ALWAYS wrote to the local SQLite
-  // queue and let the background sync engine (useOfflineSync's NetInfo
-  // listener) pick it up moments later — technically correct eventually,
-  // but wrong behavior on a stable connection: a technician standing
-  // right next to the printer with full signal would still see "It will
-  // sync automatically once you're online" instead of an immediate
-  // confirmed save, and the itinerary row stayed in the "Queued" state
-  // for a beat longer than it needed to.
-  //
-  // Now: check connectivity first (NetInfo.fetch(), same isConnected +
-  // isInternetReachable!==false check useOfflineSync already uses for
-  // "online"). If it looks online, attempt submitReport() — the same
-  // function drainQueue()/syncOne() use — directly, with its existing
-  // 30s (API) / 60s (R2 PUT) timeouts. Those timeouts are what make this
-  // safe on an "unstable" connection too: NetInfo can report a bar of
-  // signal that then stalls mid-request, and a stalled attempt still
-  // fails and falls through to the queue below rather than hanging the
-  // Save button forever. Only a genuinely offline device (or a direct
-  // attempt that throws for any reason) falls back to the queue — this
-  // fallback path is otherwise byte-for-byte the same enqueueReport()
-  // flow as before, so an unreachable server still can't lose a report.
+  // Save Maintenance: offline-queue-first (reverted from a brief
+  // online-first experiment) — see the comment right above enqueueReport()
+  // below for why, and useOfflineSync.ts for the auto-retry side of this.
   const saveMaintenance = async () => {
     const printer = printerQuery.data?.maintenanceData;
     if (!printer) {
@@ -388,63 +367,40 @@ export function MaintenanceFormScreen() {
         },
       };
 
+      // Optimize before writing to disk — see src/lib/image-processing.ts.
+      // Resized/compressed here (not at capture time for the signature,
+      // since the raw canvas base64 only exists at save time) so the
+      // queued row and every later upload attempt always references the
+      // already-optimized file, never the raw canvas output.
       let localSignatureUri: string | null = null;
       if (signatureUri) {
         const bytes = toByteArray(signatureUri.replace(/^data:image\/png;base64,/, ""));
-        const file = new File(Paths.cache, `sig-${id}.png`);
-        file.write(bytes);
-        localSignatureUri = file.uri;
+        const rawFile = new File(Paths.cache, `sig-raw-${id}.png`);
+        rawFile.write(bytes);
+        localSignatureUri = await optimizeSignature(rawFile.uri);
       }
 
-      const submission = {
+      // Save Maintenance is offline-queue-first, by design: enqueueReport()
+      // below is a local SQLite insert, so this resolves near-instantly
+      // regardless of connection quality — a technician standing next to a
+      // printer with poor signal isn't stuck waiting on a network
+      // round-trip (or its timeout) just to get an "it's saved" confirm.
+      // The actual server sync is entirely useOfflineSync's job: it
+      // triggers on the offline→online transition, on app foreground, AND
+      // now on a periodic interval (~20s) while online with anything still
+      // pending/failed — see useOfflineSync.ts — so a queued report is
+      // retried automatically without the technician ever needing to open
+      // Synchronization and tap Sync themselves. Every retry goes through
+      // submitReport(), whose uploadToR2 PUTs to a fixed per-report key and
+      // whose /api/maintain POST is clientUuid-idempotent, so however many
+      // times a report gets retried it can only ever land once server-side.
+      await enqueueReport({
         id,
+        createdAt: new Date().toISOString(),
         payload: JSON.stringify(payload),
         photoLocalUris: JSON.stringify([nozzlePhotoUri]),
         signatureLocalUri: localSignatureUri,
         schedDetailsId: params.schedDetailsId ?? null,
-      };
-
-      // Same "online" definition useOfflineSync uses elsewhere in this
-      // app — isInternetReachable is explicitly checked !== false (not
-      // ===true) since some networks/OS versions never resolve it and
-      // leave it null, which shouldn't be treated as "offline."
-      const net = await NetInfo.fetch();
-      const looksOnline = !!net.isConnected && net.isInternetReachable !== false;
-
-      if (looksOnline) {
-        try {
-          await submitReport(api, submission);
-          // Server now has the report (and, if opened from an itinerary
-          // row, has already flipped that schedule detail's isMaintained
-          // flag via /api/sched-details inside submitReport). Invalidate
-          // both queries so DashboardScreen's itinerary reflects
-          // "Maintained" immediately on the next focus instead of
-          // waiting on the offline-sync hook's periodic poll — that hook
-          // never ran a drain for this report since it was never queued.
-          queryClient.invalidateQueries({ queryKey: ["schedule"] });
-          queryClient.invalidateQueries({ queryKey: ["attendance-status"] });
-          Alert.alert("Saved", "Report saved to the server.", [
-            { text: "OK", onPress: () => navigation.goBack() },
-          ]);
-          return;
-        } catch (err) {
-          // Fall through to the offline queue below — a stalled/failed
-          // request on a connection NetInfo thought was fine (the
-          // "unstable connection" case) is exactly what the queue exists
-          // to catch. Nothing uploaded so far is wasted: uploadToR2 PUTs
-          // to a fixed per-report key and /api/maintain's clientUuid is
-          // idempotent, so the queued retry safely resumes/repeats
-          // rather than duplicating anything.
-          console.log(
-            "[maintain] direct online save failed, falling back to offline queue",
-            err instanceof Error ? err.message : String(err)
-          );
-        }
-      }
-
-      await enqueueReport({
-        ...submission,
-        createdAt: new Date().toISOString(),
       });
 
       Alert.alert("Saved", "Report saved. It will sync automatically once you're online.", [
