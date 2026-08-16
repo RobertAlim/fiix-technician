@@ -44,12 +44,14 @@ import * as Location from "expo-location";
 import * as NavigationBar from "expo-navigation-bar";
 import SignatureScreen, { SignatureViewRef } from "react-native-signature-canvas";
 import { v4 as uuidv4 } from "uuid";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import NetInfo from "@react-native-community/netinfo";
 import { File, Paths } from "expo-file-system";
 import { toByteArray } from "base64-js";
 
 import { useApi } from "@/hooks/useApi";
 import { enqueueReport } from "@/lib/offline-db";
+import { submitReport } from "@/lib/sync-engine";
 import { onNextScan } from "@/lib/scan-bridge";
 import { useAppTheme } from "@/theme";
 import { Palette } from "@/theme/palettes";
@@ -100,6 +102,7 @@ export function MaintenanceFormScreen() {
   const { params } = useRoute<FormRoute>();
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
   const api = useApi();
+  const queryClient = useQueryClient();
   const sigRef = React.useRef<SignatureViewRef>(null);
 
   // Hides Android's system nav bar (back/home/recents) specifically while
@@ -287,7 +290,30 @@ export function MaintenanceFormScreen() {
     return null;
   };
 
-  const saveOffline = async () => {
+  // Save Maintenance: online-first, offline-queue-as-fallback.
+  //
+  // The previous version of this screen ALWAYS wrote to the local SQLite
+  // queue and let the background sync engine (useOfflineSync's NetInfo
+  // listener) pick it up moments later — technically correct eventually,
+  // but wrong behavior on a stable connection: a technician standing
+  // right next to the printer with full signal would still see "It will
+  // sync automatically once you're online" instead of an immediate
+  // confirmed save, and the itinerary row stayed in the "Queued" state
+  // for a beat longer than it needed to.
+  //
+  // Now: check connectivity first (NetInfo.fetch(), same isConnected +
+  // isInternetReachable!==false check useOfflineSync already uses for
+  // "online"). If it looks online, attempt submitReport() — the same
+  // function drainQueue()/syncOne() use — directly, with its existing
+  // 30s (API) / 60s (R2 PUT) timeouts. Those timeouts are what make this
+  // safe on an "unstable" connection too: NetInfo can report a bar of
+  // signal that then stalls mid-request, and a stalled attempt still
+  // fails and falls through to the queue below rather than hanging the
+  // Save button forever. Only a genuinely offline device (or a direct
+  // attempt that throws for any reason) falls back to the queue — this
+  // fallback path is otherwise byte-for-byte the same enqueueReport()
+  // flow as before, so an unreachable server still can't lose a report.
+  const saveMaintenance = async () => {
     const printer = printerQuery.data?.maintenanceData;
     if (!printer) {
       Alert.alert("Printer details are still loading — try again in a moment.");
@@ -370,13 +396,55 @@ export function MaintenanceFormScreen() {
         localSignatureUri = file.uri;
       }
 
-      await enqueueReport({
+      const submission = {
         id,
-        createdAt: new Date().toISOString(),
         payload: JSON.stringify(payload),
         photoLocalUris: JSON.stringify([nozzlePhotoUri]),
         signatureLocalUri: localSignatureUri,
         schedDetailsId: params.schedDetailsId ?? null,
+      };
+
+      // Same "online" definition useOfflineSync uses elsewhere in this
+      // app — isInternetReachable is explicitly checked !== false (not
+      // ===true) since some networks/OS versions never resolve it and
+      // leave it null, which shouldn't be treated as "offline."
+      const net = await NetInfo.fetch();
+      const looksOnline = !!net.isConnected && net.isInternetReachable !== false;
+
+      if (looksOnline) {
+        try {
+          await submitReport(api, submission);
+          // Server now has the report (and, if opened from an itinerary
+          // row, has already flipped that schedule detail's isMaintained
+          // flag via /api/sched-details inside submitReport). Invalidate
+          // both queries so DashboardScreen's itinerary reflects
+          // "Maintained" immediately on the next focus instead of
+          // waiting on the offline-sync hook's periodic poll — that hook
+          // never ran a drain for this report since it was never queued.
+          queryClient.invalidateQueries({ queryKey: ["schedule"] });
+          queryClient.invalidateQueries({ queryKey: ["attendance-status"] });
+          Alert.alert("Saved", "Report saved to the server.", [
+            { text: "OK", onPress: () => navigation.goBack() },
+          ]);
+          return;
+        } catch (err) {
+          // Fall through to the offline queue below — a stalled/failed
+          // request on a connection NetInfo thought was fine (the
+          // "unstable connection" case) is exactly what the queue exists
+          // to catch. Nothing uploaded so far is wasted: uploadToR2 PUTs
+          // to a fixed per-report key and /api/maintain's clientUuid is
+          // idempotent, so the queued retry safely resumes/repeats
+          // rather than duplicating anything.
+          console.log(
+            "[maintain] direct online save failed, falling back to offline queue",
+            err instanceof Error ? err.message : String(err)
+          );
+        }
+      }
+
+      await enqueueReport({
+        ...submission,
+        createdAt: new Date().toISOString(),
       });
 
       Alert.alert("Saved", "Report saved. It will sync automatically once you're online.", [
@@ -658,7 +726,7 @@ export function MaintenanceFormScreen() {
         <Text style={styles.secondaryButtonText}>Clear Signature</Text>
       </Pressable>
 
-      <Pressable style={styles.primaryButton} onPress={saveOffline} disabled={saving}>
+      <Pressable style={styles.primaryButton} onPress={saveMaintenance} disabled={saving}>
         {saving ? (
           <ActivityIndicator color={theme.primaryForeground} />
         ) : (

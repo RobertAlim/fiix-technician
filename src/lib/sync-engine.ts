@@ -76,72 +76,104 @@ async function uploadToR2(
   return key;
 }
 
+/** Same shape a QueuedReport needs, minus the queue-only bookkeeping
+ *  fields (status/lastError/attempts) — this is what's needed to
+ *  actually SUBMIT a report, whether it's coming straight out of
+ *  MaintenanceFormScreen (direct online save) or out of the SQLite
+ *  queue (drainQueue). */
+export type ReportSubmission = Pick<
+  QueuedReport,
+  "id" | "payload" | "photoLocalUris" | "signatureLocalUri" | "schedDetailsId"
+>;
+
+/**
+ * The actual "send this report to the server" logic — presign+PUT the
+ * nozzle photo and signature to R2, POST /api/maintain, then link the
+ * schedule detail if this came from an itinerary tap. Extracted out of
+ * syncOne() so MaintenanceFormScreen can call it directly for an
+ * online-first save (see saveMaintenance() there) instead of always
+ * detouring through the offline queue even when the connection is
+ * fine — syncOne() below is now just this plus queue bookkeeping.
+ *
+ * Safe to call again for the same `id` if a previous attempt partially
+ * succeeded (e.g. uploaded the photo, then the /api/maintain POST
+ * failed): uploadToR2 PUTs to the same fixed key every time, and
+ * /api/maintain's clientUuid onConflictDoNothing means a repeat POST
+ * resolves to the same row rather than creating a duplicate.
+ */
+export async function submitReport(
+  api: ApiClient,
+  item: ReportSubmission
+): Promise<{ mtId: number }> {
+  const payload = JSON.parse(item.payload);
+  const photoUris: string[] = JSON.parse(item.photoLocalUris);
+
+  // nozzlePath is mandatory on the real form (nozzleBlob is non-optional
+  // in the web schema) — the first captured photo fills that slot;
+  // MaintenanceFormScreen is responsible for enforcing at least one photo
+  // exists before this ever queues.
+  const [nozzleUri] = photoUris;
+  const nozzlePath = nozzleUri
+    ? await uploadToR2(api, nozzleUri, `maintain/${item.id}/nozzle.jpg`, R2_BUCKETS.nozzle)
+    : undefined;
+
+  const signPath = item.signatureLocalUri
+    ? await uploadToR2(
+        api,
+        item.signatureLocalUri,
+        `maintain/${item.id}/signature.png`,
+        R2_BUCKETS.signature,
+        "image/png"
+      )
+    // "Unsigned" — matches features/offline-sync/save-maintenance-
+    // report.ts's `signKey ?? "Unsigned"` exactly. This is a real,
+    // pervasive sentinel value the web app checks in at least eight
+    // places (PDF report rendering, dashboards, the purge tool) — not
+    // an edge case being invented here. `maintain.signPath` is a real
+    // NOT NULL column in production (confirmed via a live Postgres
+    // constraint-violation error, even though the local schema.ts file
+    // doesn't currently declare `.notNull()` — see the fix there too),
+    // so sending `undefined` here — which JSON.stringify simply drops
+    // from the request body entirely — reliably crashed the insert for
+    // every report a technician submitted without signing. This isn't
+    // a workaround; it's the same real value the rest of the app
+    // already treats as the canonical "no signature yet" state.
+    : "Unsigned";
+
+  const { id: mtId } = await api.post<{ id: number }>("/api/maintain", {
+    ...payload,
+    nozzlePath,
+    signPath,
+    // Matches maintain.clientUuid (see db/schema.ts) — the route does
+    // `.onConflictDoNothing({ target: maintain.clientUuid })` and
+    // always resolves + returns the winning row's id either way, so a
+    // retry after a lost response is a safe no-op that still yields the
+    // same mtId needed for the schedule-link step below.
+    clientUuid: item.id,
+  });
+
+  // Mirrors features/offline-sync/sync-engine.ts step 4 exactly: link
+  // the schedule detail this report was opened from (itinerary tap),
+  // if any — scan/manual-entry reports have no schedDetailsId and skip
+  // this. POST /api/sched-details is what marks the itinerary row
+  // maintained server-side; skipping it would leave a Technician's
+  // completed stop still showing as pending, which is the whole reason
+  // this step exists rather than being optional.
+  if (item.schedDetailsId != null) {
+    await api.post("/api/sched-details", { schedDetailsId: item.schedDetailsId, mtId });
+  }
+
+  return { mtId };
+}
+
 async function syncOne(api: ApiClient, item: QueuedReport): Promise<void> {
   await markSyncing(item.id);
   try {
-    const payload = JSON.parse(item.payload);
-    const photoUris: string[] = JSON.parse(item.photoLocalUris);
-
-    // nozzlePath is mandatory on the real form (nozzleBlob is non-optional
-    // in the web schema) — the first captured photo fills that slot;
-    // MaintenanceFormScreen is responsible for enforcing at least one photo
-    // exists before this ever queues.
-    const [nozzleUri] = photoUris;
-    const nozzlePath = nozzleUri
-      ? await uploadToR2(api, nozzleUri, `maintain/${item.id}/nozzle.jpg`, R2_BUCKETS.nozzle)
-      : undefined;
-
-    const signPath = item.signatureLocalUri
-      ? await uploadToR2(
-          api,
-          item.signatureLocalUri,
-          `maintain/${item.id}/signature.png`,
-          R2_BUCKETS.signature,
-          "image/png"
-        )
-      // "Unsigned" — matches features/offline-sync/save-maintenance-
-      // report.ts's `signKey ?? "Unsigned"` exactly. This is a real,
-      // pervasive sentinel value the web app checks in at least eight
-      // places (PDF report rendering, dashboards, the purge tool) — not
-      // an edge case being invented here. `maintain.signPath` is a real
-      // NOT NULL column in production (confirmed via a live Postgres
-      // constraint-violation error, even though the local schema.ts file
-      // doesn't currently declare `.notNull()` — see the fix there too),
-      // so sending `undefined` here — which JSON.stringify simply drops
-      // from the request body entirely — reliably crashed the insert for
-      // every report a technician submitted without signing. This isn't
-      // a workaround; it's the same real value the rest of the app
-      // already treats as the canonical "no signature yet" state.
-      : "Unsigned";
-
-    const { id: mtId } = await api.post<{ id: number }>("/api/maintain", {
-      ...payload,
-      nozzlePath,
-      signPath,
-      // Matches maintain.clientUuid (see db/schema.ts) — the route does
-      // `.onConflictDoNothing({ target: maintain.clientUuid })` and
-      // always resolves + returns the winning row's id either way, so a
-      // retry after a lost response is a safe no-op that still yields the
-      // same mtId needed for the schedule-link step below.
-      clientUuid: item.id,
-    });
-
-    // Mirrors features/offline-sync/sync-engine.ts step 4 exactly: link
-    // the schedule detail this report was opened from (itinerary tap),
-    // if any — scan/manual-entry reports have no schedDetailsId and skip
-    // this. POST /api/sched-details is what marks the itinerary row
-    // maintained server-side; skipping it would leave a Technician's
-    // completed stop still showing as pending, which is the whole reason
-    // this step exists rather than being optional. Deliberately NOT
-    // caught separately from the block above — if this throws, the catch
-    // below marks the report failed (not removed), so the next sync
-    // attempt retries from here. The maintain POST is safe to repeat
-    // (see clientUuid note above), so this is a safe at-least-once retry
-    // rather than a risk of a duplicate report.
-    if (item.schedDetailsId != null) {
-      await api.post("/api/sched-details", { schedDetailsId: item.schedDetailsId, mtId });
-    }
-
+    // Deliberately NOT caught separately inside submitReport — if any
+    // step throws, this catch marks the report failed (not removed), so
+    // the next drain attempt retries from here rather than losing the
+    // report.
+    await submitReport(api, item);
     await removeReport(item.id);
   } catch (err) {
     await markFailed(item.id, err instanceof Error ? err.message : String(err));

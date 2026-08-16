@@ -20,6 +20,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { View, Text, Pressable, StyleSheet, FlatList, ActivityIndicator, Alert, ScrollView, Linking, Modal } from "react-native";
 import * as Location from "expo-location";
 import { Feather } from "@expo/vector-icons";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigation } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
@@ -107,6 +108,19 @@ function todayInManila(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Manila" }).format(new Date());
 }
 
+/** "12:34 AM" in Asia/Manila, for the Shift Complete card's timed-out-at
+ *  line — same reasoning as todayInManila(): anchor to Manila regardless
+ *  of the device's own timezone, since that's what the rest of this
+ *  screen (and the server) treat as canonical "today." */
+function formatManilaTime(iso: string): string {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Manila",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(new Date(iso));
+}
+
 // Distinguishes a background-permission denial (which shows its own
 // Settings/Cancel dialog, handled inline in timeInMutation below) from
 // every other Time In failure, so the generic onError alert doesn't fire
@@ -163,16 +177,27 @@ export function DashboardScreen() {
   });
 
   const onDuty = !!statusQuery.data?.session && !statusQuery.data.session.timeOut;
+  // Today's session exists AND has a timeOut — the technician already
+  // completed their shift today. Attendance-status is scoped to "today"
+  // server-side (see the Manila-anchored session lookup this route
+  // uses), so this is naturally reset the moment a new day's session
+  // doesn't exist yet — no separate "next working day" check needed:
+  // there simply is no session to have a timeOut on until the technician
+  // times in again on a later scheduled day.
+  const hasTimedOutToday = !!statusQuery.data?.session && !!statusQuery.data.session.timeOut;
 
-  // Today's itinerary, per-printer — only fetched once on duty (before
-  // Time In there's nothing to tap into yet; the pre-Time-In view only
-  // needs the single firstStop from attendance-status above).
+  // Today's itinerary, per-printer — fetched once on duty (for the
+  // tappable list) AND after Time Out (for the read-only Shift Complete
+  // summary below, which needs the same per-printer Maintained/Missed
+  // truth). Before Time In there's nothing to tap into yet; the
+  // pre-Time-In view only needs the single firstStop from
+  // attendance-status above.
   const technicianId = userStatusQuery.data?.id;
   const scheduleQuery = useQuery({
     queryKey: ["schedule", technicianId, "today"],
     queryFn: () =>
       api.get<ScheduleRow[]>(`/api/schedule?technicianId=${technicianId}&scheduledAt=${todayInManila()}`),
-    enabled: onDuty && technicianId != null,
+    enabled: (onDuty || hasTimedOutToday) && technicianId != null,
   });
 
   const openMaintenance = (detail: ScheduleDetailRow) => {
@@ -246,7 +271,11 @@ export function DashboardScreen() {
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
     async function start() {
-      if (onDuty || !geofence) return;
+      // Also skip once the shift is over — there's no Time In pill to
+      // feed once the Dashboard has switched to the locked Shift
+      // Complete summary, so continuing to watch position here would
+      // just be a pointless battery draw.
+      if (onDuty || hasTimedOutToday || !geofence) return;
       setLocationState({ kind: "checking" });
 
       const perm = await Location.requestForegroundPermissionsAsync();
@@ -293,7 +322,7 @@ export function DashboardScreen() {
       watchSubRef.current?.remove();
       watchSubRef.current = null;
     };
-  }, [onDuty, geofence?.latitude, geofence?.longitude]);
+  }, [onDuty, hasTimedOutToday, geofence?.latitude, geofence?.longitude]);
 
   useEffect(() => {
     console.log(`[gps] onDuty effect: onDuty=${onDuty} gpsBackgroundActive=${gpsBackgroundActive}`);
@@ -456,6 +485,117 @@ export function DashboardScreen() {
       </View>
     );
   };
+
+  // Shift Complete — replaces the entire Dashboard (not just a disabled
+  // Time In button) once today's session has a timeOut. This is what
+  // satisfies "prevent timing in again until the next scheduled working
+  // day": there is no Time In control anywhere in this branch, and the
+  // off-duty branch below (which owns the only Time In button in this
+  // screen) is unreachable today since hasTimedOutToday is checked
+  // first. The gate is naturally daily — see the note by
+  // hasTimedOutToday's declaration above.
+  if (hasTimedOutToday) {
+    const allDetails = (scheduleQuery.data ?? []).flatMap((s) => s.scheduleDetails);
+    const maintainedCount = allDetails.filter(
+      (d) => d.isMaintained || locallyQueuedSchedDetailIds.has(d.id)
+    ).length;
+    const missedCount = allDetails.length - maintainedCount;
+    const timeOutIso = statusQuery.data?.session?.timeOut ?? null;
+
+    return (
+      <ScrollView style={styles.container} contentContainerStyle={{ paddingBottom: 24 }}>
+        {/* Matches the web app's "Shift complete" card exactly: plain
+            card, calendar-check icon, bold title, single muted subtitle
+            line naming the actual time-out time. The extra
+            counts/message below are new to mobile — the web reference
+            doesn't have a printer-by-printer breakdown at all — kept
+            OUTSIDE this card so the card itself stays a 1:1 match. */}
+        <View style={styles.shiftCompleteCard}>
+          <MaterialCommunityIcons name="calendar-check" size={40} color={theme.success} />
+          <Text style={styles.shiftCompleteTitle}>Shift complete</Text>
+          <Text style={styles.shiftCompleteSubtitle}>
+            {timeOutIso
+              ? `You timed out at ${formatManilaTime(timeOutIso)}. See you on your next scheduled day.`
+              : "See you on your next scheduled day."}
+          </Text>
+        </View>
+
+        <Text style={styles.subtitle2}>
+          For now, please review the summary of your completed tasks for the day.
+        </Text>
+
+        {allDetails.length > 0 && (
+          <View style={styles.shiftStatsRow}>
+            <View style={styles.shiftStat}>
+              <Text style={[styles.shiftStatValue, { color: theme.success }]}>{maintainedCount}</Text>
+              <Text style={styles.shiftStatLabel}>Maintained</Text>
+            </View>
+            <View style={styles.shiftStatDivider} />
+            <View style={styles.shiftStat}>
+              <Text style={[styles.shiftStatValue, { color: theme.destructive }]}>{missedCount}</Text>
+              <Text style={styles.shiftStatLabel}>Missed</Text>
+            </View>
+          </View>
+        )}
+
+        <Text style={styles.sectionTitle}>Today's Summary</Text>
+        {scheduleQuery.isLoading ? (
+          <ActivityIndicator color={theme.primary} />
+        ) : scheduleQuery.isError ? (
+          <Text style={styles.error}>Couldn't load today's summary.</Text>
+        ) : allDetails.length === 0 ? (
+          <Text style={styles.subtitle}>You had no scheduled visits today.</Text>
+        ) : (
+          (scheduleQuery.data ?? []).map((schedule) => (
+            <View key={schedule.id} style={{ marginBottom: 16 }}>
+              <Text style={styles.stopClient}>{schedule.client.name}</Text>
+              <Text style={styles.stopLocation}>{schedule.location.name}</Text>
+              <View style={{ gap: 8, marginTop: 8 }}>
+                {schedule.scheduleDetails.map((detail) => {
+                  // A report saved but not yet synced still represents
+                  // completed work, not a miss — see saveMaintenance()'s
+                  // online-first logic, which can leave a report queued
+                  // for a short window on a bad connection even though
+                  // the technician genuinely finished the job.
+                  const isQueued = locallyQueuedSchedDetailIds.has(detail.id);
+                  const status: "Maintained" | "Pending Sync" | "Missed" = detail.isMaintained
+                    ? "Maintained"
+                    : isQueued
+                    ? "Pending Sync"
+                    : "Missed";
+                  const statusColor =
+                    status === "Maintained"
+                      ? theme.success
+                      : status === "Pending Sync"
+                      ? theme.warning
+                      : theme.destructive;
+                  const statusIcon =
+                    status === "Maintained" ? "check-circle" : status === "Pending Sync" ? "clock" : "x-circle";
+                  return (
+                    <View key={detail.id} style={[styles.printerRow, styles.printerRowDone]}>
+                      <View style={styles.printerIconWrap}>
+                        <Feather name="printer" size={16} color={theme.mutedForeground} />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.printerModel}>{detail.printer.model.name ?? "Printer"}</Text>
+                        <Text style={styles.printerSerial}>{detail.printer.serialNo}</Text>
+                      </View>
+                      <View style={[styles.statusBadge, { backgroundColor: `${statusColor}26` }]}>
+                        <Feather name={statusIcon} size={11} color={statusColor} />
+                        <Text style={[styles.statusBadgeText, { color: statusColor, marginLeft: 4 }]}>
+                          {status}
+                        </Text>
+                      </View>
+                    </View>
+                  );
+                })}
+              </View>
+            </View>
+          ))
+        )}
+      </ScrollView>
+    );
+  }
 
   if (!onDuty) {
     return (
@@ -656,11 +796,11 @@ export function DashboardScreen() {
                       </View>
                       {detail.isMaintained ? (
                         <View style={[styles.statusBadge, styles.statusBadgeDone]}>
-                          <Text style={[styles.statusBadgeText, { color: theme.success }]}>Saved</Text>
+                          <Text style={[styles.statusBadgeText, { color: theme.success }]}>Maintained</Text>
                         </View>
                       ) : isQueued ? (
                         <View style={[styles.statusBadge, styles.statusBadgeQueued]}>
-                          <Text style={[styles.statusBadgeText, { color: theme.warning }]}>Queued</Text>
+                          <Text style={[styles.statusBadgeText, { color: theme.warning }]}>Pending Sync</Text>
                         </View>
                       ) : (
                         <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
@@ -821,6 +961,8 @@ function createStyles(theme: Palette) {
     },
     printerRowDone: { opacity: 0.6 },
     statusBadge: {
+      flexDirection: "row",
+      alignItems: "center",
       borderRadius: 999,
       paddingHorizontal: 8,
       paddingVertical: 3,
@@ -828,6 +970,39 @@ function createStyles(theme: Palette) {
     statusBadgeDone: { backgroundColor: "rgba(67,185,102,0.15)" },
     statusBadgeQueued: { backgroundColor: "rgba(233,171,43,0.15)" },
     statusBadgeText: { fontSize: 10, fontWeight: "700" },
+
+    shiftCompleteCard: {
+      backgroundColor: theme.card,
+      borderRadius: 20,
+      padding: 28,
+      alignItems: "center",
+      gap: 8,
+      marginBottom: 16,
+      // Screenshot shows a plain elevated white card with no visible
+      // border, unlike this app's other cards (timeInCard, stopCard,
+      // etc.) which all use a 1px theme.border outline — matched here
+      // deliberately, not an oversight.
+      shadowColor: "#000",
+      shadowOpacity: 0.05,
+      shadowRadius: 12,
+      shadowOffset: { width: 0, height: 4 },
+      elevation: 2,
+    },
+    shiftCompleteTitle: { fontSize: 17, fontWeight: "700", color: theme.foreground, marginTop: 4 },
+    shiftCompleteSubtitle: { color: theme.mutedForeground, fontSize: 13, textAlign: "center" },
+    subtitle2: { color: theme.mutedForeground, fontSize: 13, textAlign: "center", marginBottom: 4 },
+    shiftStatsRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: 20,
+      marginTop: 12,
+      marginBottom: 4,
+    },
+    shiftStat: { alignItems: "center" },
+    shiftStatValue: { fontSize: 22, fontWeight: "800" },
+    shiftStatLabel: { color: theme.mutedForeground, fontSize: 12, marginTop: 2 },
+    shiftStatDivider: { width: 1, height: 28, backgroundColor: theme.border },
     printerIconWrap: {
       width: 32,
       height: 32,
