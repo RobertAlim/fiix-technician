@@ -28,6 +28,7 @@ import {
 } from "react-native";
 import { useNavigation, useRoute, RouteProp } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
+import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
 
 import { emitCrop } from "@/lib/crop-bridge";
 import { cropAndOptimizeNozzlePhoto } from "@/lib/image-processing";
@@ -55,10 +56,18 @@ export function CropImageScreen() {
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
   const { params } = useRoute<CropRoute>();
 
+  // The uri actually displayed/cropped from — NOT params.uri directly.
+  // See the useEffect below for why: this is the raw capture re-encoded
+  // once to bake its EXIF orientation into the pixel buffer, which is
+  // what was actually producing "saves the top-left corner instead of
+  // the selected area" — that bug was a coordinate-space mismatch, not a
+  // math error in the crop rect itself.
+  const [normalizedUri, setNormalizedUri] = useState<string | null>(null);
   const [imgSize, setImgSize] = useState<{ width: number; height: number } | null>(null);
   const [layout, setLayout] = useState<{ dispW: number; dispH: number } | null>(null);
   const [crop, setCrop] = useState<Rect | null>(null);
   const [saving, setSaving] = useState(false);
+  const [loadError, setLoadError] = useState(false);
 
   // Only ever read inside gesture callbacks, which close over stale state
   // otherwise (PanResponder handlers are created once, not per-render).
@@ -71,18 +80,45 @@ export function CropImageScreen() {
   };
 
   React.useEffect(() => {
-    Image.getSize(
-      params.uri,
-      (width, height) => {
-        setImgSize({ width, height });
+    let cancelled = false;
+    (async () => {
+      try {
+        // THE ACTUAL FIX: a phone camera's raw pixel buffer is very often
+        // physically landscape with an EXIF orientation tag (e.g. "rotate
+        // 90°") applied on TOP for a portrait shot — extremely common for
+        // exactly the kind of portrait photo a technician takes of a
+        // printed test page. React Native's <Image> (and Image.getSize)
+        // both render/measure respecting that tag, so what's ON SCREEN
+        // is correctly oriented. But expo-image-manipulator's `crop`
+        // action operates on the RAW un-rotated buffer underneath —
+        // originX/originY computed from the on-screen (rotated) box
+        // therefore land in the wrong place once reinterpreted against
+        // the unrotated buffer, which is exactly what "always grabs the
+        // top-left corner instead of the selected area" looks like.
+        //
+        // Fix: run the raw capture through manipulateAsync with NO
+        // transform actions. The library still fully decodes and
+        // re-encodes the image to do this, which bakes the EXIF rotation
+        // into the actual pixel data and resets the orientation tag —
+        // there is now only ONE coordinate space, and it's the same one
+        // this result's own width/height describe. Using THIS call's
+        // returned width/height (not a separate Image.getSize call) is
+        // what guarantees the crop math below and the actual crop action
+        // are always talking about the exact same buffer.
+        const normalized = await manipulateAsync(params.uri, [], { format: SaveFormat.JPEG });
+        if (cancelled) return;
+
+        setNormalizedUri(normalized.uri);
+        setImgSize({ width: normalized.width, height: normalized.height });
+
         const screen = Dimensions.get("window");
         const maxW = screen.width - 32;
         const maxH = screen.height * 0.6;
         let dispW = maxW;
-        let dispH = dispW * (height / width);
+        let dispH = dispW * (normalized.height / normalized.width);
         if (dispH > maxH) {
           dispH = maxH;
-          dispW = dispH * (width / height);
+          dispW = dispH * (normalized.width / normalized.height);
         }
         setLayout({ dispW, dispH });
         const marginX = dispW * 0.08;
@@ -93,9 +129,16 @@ export function CropImageScreen() {
           width: dispW - marginX * 2,
           height: dispH - marginY * 2,
         });
-      },
-      () => setImgSize({ width: 0, height: 0 })
-    );
+      } catch (err) {
+        if (!cancelled) {
+          console.log("[crop] failed to normalize orientation", err instanceof Error ? err.message : String(err));
+          setLoadError(true);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params.uri]);
 
@@ -180,7 +223,7 @@ export function CropImageScreen() {
   );
 
   const confirmCrop = async () => {
-    if (!crop || !layout || !imgSize) return;
+    if (!crop || !layout || !imgSize || !normalizedUri) return;
     setSaving(true);
     try {
       const scaleX = imgSize.width / layout.dispW;
@@ -191,7 +234,12 @@ export function CropImageScreen() {
         width: Math.round(crop.width * scaleX),
         height: Math.round(crop.height * scaleY),
       };
-      const finalUri = await cropAndOptimizeNozzlePhoto(params.uri, pixelCrop);
+      // normalizedUri, not params.uri — the orientation-normalized file
+      // from the effect above. imgSize/layout were both derived from
+      // THIS file, so pixelCrop is only valid against this same file;
+      // passing the original params.uri here would silently reintroduce
+      // the exact bug this screen exists to fix.
+      const finalUri = await cropAndOptimizeNozzlePhoto(normalizedUri, pixelCrop);
       emitCrop(finalUri);
       navigation.goBack();
     } catch (err) {
@@ -204,7 +252,18 @@ export function CropImageScreen() {
     }
   };
 
-  if (!layout || !crop) {
+  if (loadError) {
+    return (
+      <View style={styles.centered}>
+        <Text style={styles.title}>Couldn't load that photo. Go back and try capturing it again.</Text>
+        <Pressable style={[styles.secondaryButton, { marginTop: 16 }]} onPress={() => navigation.goBack()}>
+          <Text style={styles.secondaryButtonText}>Go Back</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  if (!layout || !crop || !normalizedUri) {
     return (
       <View style={styles.centered}>
         <ActivityIndicator color={theme.primary} />
@@ -216,7 +275,7 @@ export function CropImageScreen() {
     <View style={styles.container}>
       <Text style={styles.title}>Drag the box over just the nozzle-check portion</Text>
       <View style={[styles.imageWrap, { width: layout.dispW, height: layout.dispH }]}>
-        <Image source={{ uri: params.uri }} style={{ width: layout.dispW, height: layout.dispH }} />
+        <Image source={{ uri: normalizedUri }} style={{ width: layout.dispW, height: layout.dispH }} />
         {/* Dimmed strips outside the crop rect — top/bottom/left/right,
             rather than a single overlay with a punched-out hole (no clip-
             path equivalent in RN StyleSheet without a masking library). */}
