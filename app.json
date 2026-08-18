@@ -59,7 +59,7 @@
 					"android": {
 						"ndkVersion": "26.1.10909125",
 						"packagingOptions": {
-							"pickFirst": ["META-INF/versions/9/OSGI-INF/MANIFEST.MF"]
+							"exclude": ["META-INF/versions/9/OSGI-INF/MANIFEST.MF"]
 						}
 					}
 				}
