@@ -18,7 +18,7 @@
     packaging = '''
         packaging {
             resources {
-                excludes += [
+                 pickFirsts += [
                     "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
                 ]
             }
