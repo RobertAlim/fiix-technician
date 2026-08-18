@@ -1,0 +1,70 @@
+- name: Generate Android project
+  run: npx expo prebuild --platform android --no-install
+
+- name: Configure Android packaging
+  working-directory: android
+  run: |
+    python3 - <<'PY'
+    from pathlib import Path
+
+    path = Path("app/build.gradle")
+    text = path.read_text()
+
+    marker = "android {"
+
+    if marker not in text:
+        raise SystemExit("Could not find android { block in app/build.gradle")
+
+    packaging = '''
+        packaging {
+            resources {
+                excludes += [
+                    "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+                ]
+            }
+        }
+    '''
+
+    text = text.replace(marker, marker + "\n" + packaging, 1)
+    path.write_text(text)
+
+    print("Android packaging configuration added.")
+    PY
+
+- name: Verify generated Android packaging
+  working-directory: android
+  run: |
+    grep -n -A10 -B3 "packaging" app/build.gradle
+
+- name: Setup Java
+  uses: actions/setup-java@v4
+  with:
+    distribution: temurin
+    java-version: 17
+
+- name: Setup Android SDK
+  uses: android-actions/setup-android@v3
+
+- name: Install Android SDK 36
+  run: |
+    sdkmanager "platform-tools"
+    sdkmanager "platforms;android-36"
+    yes | sdkmanager --licenses || true
+
+- name: Configure Gradle memory
+  working-directory: android
+  run: |
+    echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=2g -Dfile.encoding=UTF-8" >> gradle.properties
+    echo "org.gradle.daemon=false" >> gradle.properties
+    echo "org.gradle.parallel=false" >> gradle.properties
+    echo "org.gradle.workers.max=2" >> gradle.properties
+
+- name: Build Release APK
+  working-directory: android
+  run: ./gradlew assembleRelease -x lintVitalAnalyzeRelease -x lintVitalRelease
+
+- name: Upload APK
+  uses: actions/upload-artifact@v4
+  with:
+    name: fiix-technician-preview-apk
+    path: android/app/build/outputs/apk/release/app-release.apk
