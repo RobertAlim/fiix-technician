@@ -151,6 +151,21 @@ export async function startBackgroundGpsReporting(): Promise<void> {
         notificationTitle: "Fiix — On duty",
         notificationBody: "Sharing your location with dispatch while you're clocked in.",
         notificationColor: "#0f172a",
+        // Android's default is to tear the foreground service down when
+        // the app's task is swiped away from Recents, same as any other
+        // backgrounded app getting killed — false tells it this service
+        // is meant to keep running past that specific event. Confirmed
+        // against the installed expo-location's own type declarations
+        // (LocationTaskServiceOptions in Location.types.d.ts) — this is
+        // a real, currently-supported option, not deprecated/renamed.
+        // Doesn't need any app.json/manifest change on top of this:
+        // isAndroidForegroundServiceEnabled is already true there, which
+        // is what's actually responsible for the
+        // foregroundServiceType="location" manifest entry Android
+        // 10+/12+/14+ require for a location foreground service to run
+        // at all — this flag only changes what happens to that
+        // already-correctly-declared service on task removal.
+        killServiceOnDestroy: false,
       },
       // iOS: keeps delivering updates (not just significant-change) while
       // backgrounded, per the platform caveat above.
