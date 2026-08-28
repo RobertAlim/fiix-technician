@@ -45,11 +45,6 @@
 			"adaptiveIcon": {
 				"foregroundImage": "./assets/adaptive-icon.png",
 				"backgroundColor": "#0f172a"
-			},
-			"packagingOptions": {
-				"resources": {
-					"excludes": ["META-INF/versions/9/OSGI-INF/MANIFEST.MF"]
-				}
 			}
 		},
 		"plugins": [
