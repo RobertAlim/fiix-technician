@@ -43,6 +43,14 @@ interface Props {
   onReportsChanged: () => void;
 }
 
+/** The queue now carries two kinds of work, and the difference is not
+ *  cosmetic to a technician looking at a stuck item: "which of the three
+ *  things I filed today is failing?" is unanswerable if every row just
+ *  says "Pending". */
+function kindLabel(kind: QueuedReport["kind"]): string {
+  return kind === "support" ? "Support service" : "Maintenance report";
+}
+
 function statusMeta(theme: Palette, status: QueuedReport["status"]) {
   if (status === "failed") return { color: theme.destructive, label: "Failed" };
   if (status === "syncing") return { color: theme.info, label: "Uploading" };
@@ -76,7 +84,7 @@ export function SyncStatusPanel({
   const discardReport = (report: QueuedReport) => {
     Alert.alert(
       "Discard this report?",
-      "This deletes the queued maintenance report from this device permanently — it will never be sent to the server. Only do this for a report that's genuinely stuck (many failed attempts), not one that's still worth retrying.",
+      "This deletes the queued item from this device permanently — it will never be sent to the server. Only do this for a report that's genuinely stuck (many failed attempts), not one that's still worth retrying.",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -176,6 +184,7 @@ export function SyncStatusPanel({
                           <Text style={styles.reportMeta}> · attempt {r.attempts}</Text>
                         )}
                       </View>
+                      <Text style={styles.reportKind}>{kindLabel(r.kind)}</Text>
                       <Text style={styles.reportMeta}>
                         Saved {formatRelativeTime(new Date(r.createdAt))}
                         {gpsAccuracy != null ? ` · GPS ±${Math.round(gpsAccuracy)}m` : ""}
@@ -196,7 +205,7 @@ export function SyncStatusPanel({
                 })}
               </ScrollView>
             ) : (
-              <Text style={styles.emptyText}>All maintenance reports are synced to the server.</Text>
+              <Text style={styles.emptyText}>Everything is synced to the server.</Text>
             )}
           </Pressable>
         </Pressable>
@@ -267,6 +276,7 @@ function createStyles(theme: Palette) {
     reportDot: { width: 7, height: 7, borderRadius: 4 },
     reportStatus: { fontSize: 12, fontWeight: "700" },
     reportMeta: { color: theme.mutedForeground, fontSize: 11, marginLeft: 13 },
+    reportKind: { color: theme.foreground, fontSize: 11, fontWeight: "600", marginLeft: 13 },
     reportError: { color: theme.destructive, fontSize: 11, marginLeft: 13, marginTop: 2 },
     discardButton: {
       flexDirection: "row",

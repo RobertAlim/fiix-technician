@@ -8,8 +8,18 @@
 // exactly like the web app's queue.
 import * as SQLite from "expo-sqlite";
 
+/** What kind of work this queued item documents. Support services reuse
+ *  this entire queue rather than getting a parallel one of their own —
+ *  the offline story (SQLite row -> R2 presign+PUT -> POST -> retry on a
+ *  timer) is identical for both, and duplicating it would mean two
+ *  drain loops, two mutexes and two panels to keep in sync forever.
+ *  Only the endpoint, the bucket and the linking step differ, which is
+ *  exactly what sync-engine.ts branches on. */
+export type QueuedKind = "maintenance" | "support";
+
 export interface QueuedReport {
   id: string; // client-generated uuid, becomes the idempotency key server-side
+  kind: QueuedKind;
   createdAt: string;
   payload: string; // JSON-encoded maintain report body (see MaintenanceFormScreen)
   photoLocalUris: string; // JSON-encoded string[] of local file:// URIs to upload
@@ -35,6 +45,7 @@ function getDb() {
         PRAGMA journal_mode = WAL;
         CREATE TABLE IF NOT EXISTS queued_reports (
           id TEXT PRIMARY KEY NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'maintenance',
           createdAt TEXT NOT NULL,
           payload TEXT NOT NULL,
           photoLocalUris TEXT NOT NULL,
@@ -50,6 +61,15 @@ function getDb() {
       // (not data loss) if the column's already there, which this
       // swallows rather than crashing app startup over.
       await db.execAsync(`ALTER TABLE queued_reports ADD COLUMN schedDetailsId INTEGER;`).catch(() => {});
+      // Same additive-migration pattern for `kind`. The DEFAULT matters
+      // and is not cosmetic: a device upgrading with maintenance reports
+      // already sitting in the queue gets them backfilled as
+      // 'maintenance' rather than NULL, so drainQueue's branch below
+      // routes them to the endpoint they were always meant for instead
+      // of falling through to an unknown kind.
+      await db.execAsync(
+        `ALTER TABLE queued_reports ADD COLUMN kind TEXT NOT NULL DEFAULT 'maintenance';`
+      ).catch(() => {});
       // Recovery for reports orphaned in "syncing" — this can only happen
       // from a session that ended (app killed, or the drainQueue
       // concurrency bug fixed alongside this) before the attempt that set
@@ -73,9 +93,10 @@ export async function enqueueReport(
 ): Promise<void> {
   const db = await getDb();
   await db.runAsync(
-    `INSERT INTO queued_reports (id, createdAt, payload, photoLocalUris, signatureLocalUri, schedDetailsId, status, lastError, attempts)
-     VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, 0)`,
+    `INSERT INTO queued_reports (id, kind, createdAt, payload, photoLocalUris, signatureLocalUri, schedDetailsId, status, lastError, attempts)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, 0)`,
     item.id,
+    item.kind,
     item.createdAt,
     item.payload,
     item.photoLocalUris,

@@ -26,9 +26,19 @@ import {
 // three real allowed values (env.bucketName, "fiixdrive", "fiixnozzle").
 // Web uses a DIFFERENT bucket per upload kind, not one bucket for
 // everything — nozzle photos and signatures are genuinely split.
+//
+// `support` is NEW and is the one value in this map that has NOT been
+// verified against lib/r2.ts's real ALLOWED_BUCKETS — that allowlist
+// currently contains only env.bucketName, "fiixdrive" and "fiixnozzle".
+// A presign request for "fiixsupport" will be rejected with the same
+// "Bucket not allowed" error that caught us before until the bucket is
+// added there server-side (see the backend spec accompanying this
+// delta). Signatures deliberately stay in "fiixdrive" for BOTH kinds of
+// work, matching the request and the existing split.
 const R2_BUCKETS = {
   nozzle: "fiixnozzle",
   signature: "fiixdrive",
+  support: "fiixsupport",
 } as const;
 
 /**
@@ -83,7 +93,7 @@ async function uploadToR2(
  *  queue (drainQueue). */
 export type ReportSubmission = Pick<
   QueuedReport,
-  "id" | "payload" | "photoLocalUris" | "signatureLocalUri" | "schedDetailsId"
+  "id" | "kind" | "payload" | "photoLocalUris" | "signatureLocalUri" | "schedDetailsId"
 >;
 
 /**
@@ -166,6 +176,57 @@ export async function submitReport(
   return { mtId };
 }
 
+/**
+ * The support-services equivalent of submitReport(): upload the captured
+ * photo to `fiixsupport` and the signature to `fiixdrive`, then POST the
+ * completion to /api/support-services/complete.
+ *
+ * Idempotent under retry for the same reasons submitReport() is, and it
+ * matters just as much here: uploadToR2 PUTs to a fixed per-item key, and
+ * the completion route is expected to key off `clientUuid` the same way
+ * /api/maintain does (see the backend spec — this is a REQUIREMENT of
+ * that route, not a nicety, because this queue will happily replay a
+ * submission whose response was lost in transit).
+ *
+ * There is no schedule-linking step: a support service is completed IN
+ * PLACE on its own scheduled row (supportServices.id, carried in the
+ * payload), so there's no second table to flip a flag in the way
+ * /api/sched-details does for maintenance.
+ */
+async function submitSupportService(
+  api: ApiClient,
+  item: ReportSubmission
+): Promise<void> {
+  const payload = JSON.parse(item.payload);
+  const photoUris: string[] = JSON.parse(item.photoLocalUris);
+
+  const [photoUri] = photoUris;
+  const photoPath = photoUri
+    ? await uploadToR2(api, photoUri, `support/${item.id}/photo.jpg`, R2_BUCKETS.support)
+    : undefined;
+
+  const signPath = item.signatureLocalUri
+    ? await uploadToR2(
+        api,
+        item.signatureLocalUri,
+        `support/${item.id}/signature.png`,
+        R2_BUCKETS.signature,
+        "image/png"
+      )
+    // Same "Unsigned" sentinel the maintenance path uses — see the long
+    // note in submitReport() above. Reused here rather than sending null
+    // so the support table can carry the identical NOT NULL contract
+    // without a second convention to remember.
+    : "Unsigned";
+
+  await api.post("/api/support-services/complete", {
+    ...payload,
+    photoPath,
+    signPath,
+    clientUuid: item.id,
+  });
+}
+
 async function syncOne(api: ApiClient, item: QueuedReport): Promise<void> {
   await markSyncing(item.id);
   try {
@@ -173,7 +234,18 @@ async function syncOne(api: ApiClient, item: QueuedReport): Promise<void> {
     // step throws, this catch marks the report failed (not removed), so
     // the next drain attempt retries from here rather than losing the
     // report.
-    await submitReport(api, item);
+    //
+    // `kind` is read with a fallback rather than switched on exactly:
+    // a row written by an older build of this app predates the column
+    // entirely, and while the ALTER TABLE in offline-db.ts backfills
+    // 'maintenance' as its default, treating any unrecognized value as
+    // maintenance too means a queued report can never become
+    // undrainable just because a future kind was added and rolled back.
+    if (item.kind === "support") {
+      await submitSupportService(api, item);
+    } else {
+      await submitReport(api, item);
+    }
     await removeReport(item.id);
   } catch (err) {
     await markFailed(item.id, err instanceof Error ? err.message : String(err));

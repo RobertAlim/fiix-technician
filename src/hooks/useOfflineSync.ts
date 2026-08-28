@@ -60,6 +60,12 @@ export function useOfflineSync() {
         // ["schedule", technicianId, "today"] without needing to know
         // the technicianId here.
         queryClient.invalidateQueries({ queryKey: ["schedule"] });
+        // Support services need the same treatment for the same reason:
+        // a successful sync is what fills in supportServices.status
+        // server-side, so without this the Dashboard's Support Services
+        // section would keep showing a just-synced activity as
+        // "Pending Sync" until some unrelated refetch happened to run.
+        queryClient.invalidateQueries({ queryKey: ["support-services"] });
         queryClient.invalidateQueries({ queryKey: ["attendance-status"] });
       }
     } finally {

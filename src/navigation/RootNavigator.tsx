@@ -24,6 +24,8 @@ import { AppTabs } from "@/navigation/AppTabs";
 import { MaintenanceFormScreen } from "@/screens/MaintenanceFormScreen";
 import { ScanQRScreen } from "@/screens/ScanQRScreen";
 import { CropImageScreen } from "@/screens/CropImageScreen";
+import { SupportServiceFormScreen } from "@/screens/SupportServiceFormScreen";
+import { PrinterHistoryScreen } from "@/screens/PrinterHistoryScreen";
 
 export type RootStackParamList = {
   AppTabs: undefined;
@@ -43,6 +45,17 @@ export type RootStackParamList = {
   // ScanQR/scan-bridge.ts), not a param, since there's no built-in way
   // for a popped screen to hand a value back up the stack.
   CropImage: { uri: string };
+  // Support Services: only the row id is passed, for the same reason
+  // MaintenanceForm takes only a serialNo — the screen re-resolves the
+  // full activity (and its signatories) itself from one endpoint, so it
+  // behaves identically however it was reached and never renders stale
+  // params handed down from a list that may have refetched since.
+  SupportServiceForm: { supportServiceId: number };
+  // Read-only history view for one printer. serialNo, not printerId:
+  // it's the identifier every other lookup in this app is keyed by
+  // (GET /api/maintain?serialNo=, the QR codes themselves), so a caller
+  // never has to carry a second identifier just for this screen.
+  PrinterHistory: { serialNo: string };
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -153,6 +166,16 @@ export function RootNavigator() {
         name="CropImage"
         component={CropImageScreen}
         options={{ title: "Crop Photo", presentation: "modal" }}
+      />
+      <Stack.Screen
+        name="SupportServiceForm"
+        component={SupportServiceFormScreen}
+        options={{ title: "Support Service" }}
+      />
+      <Stack.Screen
+        name="PrinterHistory"
+        component={PrinterHistoryScreen}
+        options={{ title: "Printer History", presentation: "modal" }}
       />
     </Stack.Navigator>
   );

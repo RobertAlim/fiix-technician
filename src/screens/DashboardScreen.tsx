@@ -27,6 +27,8 @@ import { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import { useApi } from "@/hooks/useApi";
 import { useOfflineSync } from "@/hooks/useOfflineSync";
 import { distanceMeters } from "@/lib/geo";
+import { openDirections } from "@/lib/maps";
+import { SupportServiceRow } from "@/types/support";
 import { useAppTheme } from "@/theme";
 import { Palette } from "@/theme/palettes";
 import { RootStackParamList } from "@/navigation/RootNavigator";
@@ -211,6 +213,177 @@ export function DashboardScreen() {
     enabled: (onDuty || hasTimedOutToday) && technicianId != null,
   });
 
+  // Today's support services — the non-maintenance half of the
+  // technician's assigned work (BIR forms, collection, billing,
+  // contracts). Fetched under the same on-duty/timed-out gate as the
+  // printer itinerary, and keyed the same way, so both halves of "today"
+  // refresh together.
+  const supportQuery = useQuery({
+    queryKey: ["support-services", technicianId, "today"],
+    queryFn: () =>
+      api.get<SupportServiceRow[]>(
+        `/api/support-services?technicianId=${technicianId}&scheduledAt=${todayInManila()}`
+      ),
+    enabled: (onDuty || hasTimedOutToday) && technicianId != null,
+  });
+
+  // Coordinates for the ON-DUTY printer itinerary.
+  //
+  // Worth understanding rather than skimming: the on-duty list is
+  // rendered from GET /api/schedule (the per-PRINTER breakdown), whose
+  // rows carry NO coordinates — only /api/attendance/status's itinerary
+  // does, and it already does, because the pre-Time-In preview needed
+  // them. Both are keyed by the same schedules.id, so joining them here
+  // gives every on-duty client stop a navigate icon with ZERO backend
+  // change, instead of adding lat/lng to a second route.
+  //
+  // The fallback path matters: /api/schedule and /api/attendance/status
+  // derive "today" independently, so if they ever disagree (or the
+  // attendance payload is trimmed later), a schedule id might be absent
+  // from the map. Rather than silently dropping the icon, it falls back
+  // to matching on locationId — the coordinate belongs to the LOCATION
+  // in locationGeofences, not to the schedule, so any stop at the same
+  // location is a correct source for it.
+  const itineraryCoords = React.useMemo(() => {
+    const byScheduleId = new Map<number, { latitude: number; longitude: number }>();
+    const byLocationName = new Map<string, { latitude: number; longitude: number }>();
+    for (const stop of statusQuery.data?.itinerary ?? []) {
+      if (stop.latitude == null || stop.longitude == null) continue;
+      const coord = { latitude: stop.latitude, longitude: stop.longitude };
+      byScheduleId.set(stop.id, coord);
+      byLocationName.set(stop.location, coord);
+    }
+    return { byScheduleId, byLocationName };
+  }, [statusQuery.data?.itinerary]);
+
+  const coordsForSchedule = (schedule: ScheduleRow) =>
+    itineraryCoords.byScheduleId.get(schedule.id) ??
+    itineraryCoords.byLocationName.get(schedule.location.name) ??
+    null;
+
+  // supportServices ids with a submission already sitting in the local
+  // offline queue. Exactly the same "don't let them file it twice"
+  // protection locallyQueuedSchedDetailIds gives the printer rows — and
+  // needed for the same reason: the server's own status column only
+  // fills in once a sync completes, so between "saved offline" and
+  // "synced" the activity still looks outstanding and tappable.
+  //
+  // Read out of the queued payload rather than a dedicated column
+  // because supportServiceId is meaningful only to this kind of item;
+  // adding a second nullable id column to queued_reports for it would
+  // put a support-only concept into the shared queue schema.
+  const locallyQueuedSupportIds = React.useMemo(() => {
+    const ids = new Set<number>();
+    for (const r of offlineSync.reports) {
+      if (r.kind !== "support") continue;
+      try {
+        const id = JSON.parse(r.payload)?.supportServiceId;
+        if (typeof id === "number") ids.add(id);
+      } catch {
+        // A payload that won't parse is already broken in ways the sync
+        // panel surfaces properly — it must not take the itinerary down
+        // with it.
+      }
+    }
+    return ids;
+  }, [offlineSync.reports]);
+
+  const openSupportService = (row: SupportServiceRow) => {
+    if (row.status) {
+      Alert.alert("Already recorded", `This activity was already filed as "${row.status}".`);
+      return;
+    }
+    if (locallyQueuedSupportIds.has(row.id)) {
+      Alert.alert(
+        "Already queued",
+        "This support service is already saved and waiting to sync — check the Maintenance tab's Synchronization panel for its status."
+      );
+      return;
+    }
+    navigation.navigate("SupportServiceForm", { supportServiceId: row.id });
+  };
+
+  /** The Support Services half of the itinerary. Rendered as the printer
+   *  FlatList's footer while on duty, and again (read-only) in the Shift
+   *  Complete summary, so a technician's day is accounted for in both
+   *  places rather than support work quietly vanishing from the
+   *  end-of-shift picture. */
+  const SupportServicesSection = ({ readOnly = false }: { readOnly?: boolean }) => {
+    const rows = supportQuery.data ?? [];
+    return (
+      <View style={{ marginTop: 8 }}>
+        <Text style={styles.sectionTitle}>Support Services</Text>
+        {supportQuery.isLoading ? (
+          <ActivityIndicator color={theme.primary} />
+        ) : supportQuery.isError ? (
+          <Text style={styles.error}>Couldn't load today's support services.</Text>
+        ) : rows.length === 0 ? (
+          <Text style={styles.subtitle}>No support services scheduled today.</Text>
+        ) : (
+          <View style={{ gap: 10 }}>
+            {rows.map((row) => {
+              const isQueued = locallyQueuedSupportIds.has(row.id);
+              const effectiveStatus = row.status ?? (isQueued ? "Pending Sync" : null);
+              const statusColor =
+                effectiveStatus === "Achieved"
+                  ? theme.success
+                  : effectiveStatus === "Not Achieved"
+                  ? theme.destructive
+                  : effectiveStatus === "Pending Sync"
+                  ? theme.warning
+                  : theme.mutedForeground;
+              const locked = row.status != null || isQueued;
+              return (
+                <Pressable
+                  key={row.id}
+                  style={[styles.supportCard, locked && styles.printerRowDone]}
+                  onPress={readOnly ? undefined : () => openSupportService(row)}
+                  disabled={readOnly}
+                >
+                  <View style={styles.supportIconWrap}>
+                    <Feather name="clipboard" size={16} color={theme.info} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.stopClient}>{row.client}</Text>
+                    <Text style={styles.stopLocation}>{row.location}</Text>
+                    <View style={styles.supportTypeRow}>
+                      <Text style={styles.supportTypeTag}>{row.supportServiceType}</Text>
+                    </View>
+                    {row.notes ? <Text style={styles.notes}>{row.notes}</Text> : null}
+                  </View>
+                  <View style={{ alignItems: "flex-end", gap: 6 }}>
+                    {effectiveStatus ? (
+                      <View style={[styles.statusBadge, { backgroundColor: `${statusColor}26` }]}>
+                        <Text style={[styles.statusBadgeText, { color: statusColor }]}>
+                          {effectiveStatus}
+                        </Text>
+                      </View>
+                    ) : readOnly ? (
+                      <View style={[styles.statusBadge, { backgroundColor: `${theme.destructive}26` }]}>
+                        <Text style={[styles.statusBadgeText, { color: theme.destructive }]}>
+                          Missed
+                        </Text>
+                      </View>
+                    ) : (
+                      <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
+                    )}
+                    {!readOnly && (
+                      <NavButton
+                        navKey={`support-${row.id}`}
+                        latitude={row.latitude}
+                        longitude={row.longitude}
+                      />
+                    )}
+                  </View>
+                </Pressable>
+              );
+            })}
+          </View>
+        )}
+      </View>
+    );
+  };
+
   const openMaintenance = (detail: ScheduleDetailRow) => {
     if (detail.isMaintained) {
       Alert.alert("Already completed", "This printer's maintenance for today is already recorded.");
@@ -231,48 +404,57 @@ export function DashboardScreen() {
   };
 
   // Turn-by-turn directions with an explicit origin, not just a dropped
-  // pin — "navigate to" and "starting from the technician's current
-  // position" were both explicit in the request. Google's
-  // `/maps/dir/?api=1&origin=...&destination=...&travelmode=driving`
-  // form is what actually renders a real route between two points (the
-  // plain `/maps?q=` form used elsewhere in the web app, e.g.
-  // components/columns/maintenance-history/columns.tsx, only drops a
-  // single pin, no route). This is a universal google.com URL, not an
-  // app-specific deep link scheme, so it opens the Google Maps app if
-  // installed or falls back to a browser automatically on both platforms.
-  //
-  // Origin is resolved fresh at tap time (not reused from the live
-  // distance-check state elsewhere on this screen, which only tracks the
-  // FIRST stop's geofence) — this can be called for ANY stop in the
-  // itinerary, so it needs its own current-position fetch regardless of
-  // which stop is being navigated to. Falls back to an origin-less link
-  // (Maps still infers current location itself in that case) if
-  // permission is denied or a fix can't be obtained — degraded, not
-  // blocked entirely.
-  const [resolvingNavId, setResolvingNavId] = useState<number | null>(null);
+  // pin. The URL construction and current-position lookup now live in
+  // lib/maps.ts, since three separate row types on this screen need them
+  // (printer stops on duty, the pre-Time-In preview, and support
+  // services). Destination coordinates come from locationGeofences —
+  // this screen never invents or geocodes them, so a location with no
+  // pin configured simply has no navigate affordance rather than a
+  // link to the wrong place.
+  const [resolvingNavId, setResolvingNavId] = useState<string | null>(null);
 
-  const openInGoogleMaps = async (stopId: number, destLatitude: number, destLongitude: number) => {
-    setResolvingNavId(stopId);
+  const openInGoogleMaps = async (
+    navKey: string,
+    destLatitude: number,
+    destLongitude: number
+  ) => {
+    setResolvingNavId(navKey);
     try {
-      let originParam = "";
-      const perm = await Location.requestForegroundPermissionsAsync();
-      if (perm.status === "granted") {
-        try {
-          const fix = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-          originParam = `&origin=${fix.coords.latitude},${fix.coords.longitude}`;
-        } catch {
-          // No fix available (GPS off, emulator with no mock location,
-          // etc.) — proceed without an explicit origin rather than
-          // blocking navigation entirely over it.
-        }
-      }
-      const url = `https://www.google.com/maps/dir/?api=1${originParam}&destination=${destLatitude},${destLongitude}&travelmode=driving`;
-      await Linking.openURL(url);
+      await openDirections(destLatitude, destLongitude);
     } catch {
       Alert.alert("Couldn't open Maps", "No app was available to handle the navigation link.");
     } finally {
       setResolvingNavId(null);
     }
+  };
+
+  /** A small round navigate button, rendered only when the stop actually
+   *  has a geofence pin. Extracted because it now appears on three
+   *  different row types with identical behaviour. */
+  const NavButton = ({
+    navKey,
+    latitude,
+    longitude,
+  }: {
+    navKey: string;
+    latitude: number | null;
+    longitude: number | null;
+  }) => {
+    if (latitude == null || longitude == null) return null;
+    return (
+      <Pressable
+        style={styles.gpsButton}
+        onPress={() => openInGoogleMaps(navKey, latitude, longitude)}
+        disabled={resolvingNavId === navKey}
+        hitSlop={8}
+      >
+        {resolvingNavId === navKey ? (
+          <ActivityIndicator size="small" color={theme.primary} />
+        ) : (
+          <Feather name="navigation" size={18} color={theme.primary} />
+        )}
+      </Pressable>
+    );
   };
 
   const geofence = statusQuery.data?.geofence ?? null;
@@ -552,7 +734,7 @@ export function DashboardScreen() {
           </View>
         )}
 
-        <Text style={styles.sectionTitle}>Today's Summary</Text>
+        <Text style={styles.sectionTitle}>Technical Services · Printer Itinerary</Text>
         {scheduleQuery.isLoading ? (
           <ActivityIndicator color={theme.primary} />
         ) : scheduleQuery.isError ? (
@@ -607,6 +789,12 @@ export function DashboardScreen() {
             </View>
           ))
         )}
+
+        {/* Support work counts as the technician's day too — leaving it
+            out of the end-of-shift summary would make an errand-only day
+            look empty. Read-only here: the shift is over, so nothing in
+            this branch is actionable. */}
+        <SupportServicesSection readOnly />
       </ScrollView>
     );
   }
@@ -661,20 +849,7 @@ export function DashboardScreen() {
                   <Text style={styles.stopLocation}>{s.location}</Text>
                   {s.notes ? <Text style={styles.notes}>{s.notes}</Text> : null}
                 </View>
-                {s.latitude != null && s.longitude != null && (
-                  <Pressable
-                    style={styles.gpsButton}
-                    onPress={() => openInGoogleMaps(s.id, s.latitude as number, s.longitude as number)}
-                    disabled={resolvingNavId === s.id}
-                    hitSlop={8}
-                  >
-                    {resolvingNavId === s.id ? (
-                      <ActivityIndicator size="small" color={theme.primary} />
-                    ) : (
-                      <Feather name="navigation" size={18} color={theme.primary} />
-                    )}
-                  </Pressable>
-                )}
+                <NavButton navKey={`preview-${s.id}`} latitude={s.latitude} longitude={s.longitude} />
               </View>
             ))}
           </>
@@ -767,7 +942,14 @@ export function DashboardScreen() {
         </View>
         {syncing && <Text style={styles.syncing}>Syncing offline reports…</Text>}
       </View>
-      <Text style={styles.sectionTitle}>Today's itinerary</Text>
+      {/* Technical vs Support Services split. These are two genuinely
+          different kinds of assigned work — one is printer maintenance
+          against a printer itinerary, the other is a client errand with
+          no printer involved at all — and the request was explicit that
+          they stay distinct rather than being merged into one "today"
+          list. Rendered as one FlatList (printer stops) with the support
+          section as its footer, so the whole screen scrolls as a single
+          surface and the Time Out button stays pinned below both. */}
       {scheduleQuery.isLoading ? (
         <ActivityIndicator color={theme.primary} />
       ) : scheduleQuery.isError ? (
@@ -776,55 +958,97 @@ export function DashboardScreen() {
         <FlatList
           data={scheduleQuery.data ?? []}
           keyExtractor={(s) => String(s.id)}
-          contentContainerStyle={{ gap: 16 }}
-          renderItem={({ item: schedule }) => (
-            <View>
-              <Text style={styles.stopClient}>{schedule.client.name}</Text>
-              <Text style={styles.stopLocation}>{schedule.location.name}</Text>
-              <View style={{ gap: 8, marginTop: 8 }}>
-                {schedule.scheduleDetails.map((detail) => {
-                  const isQueued = locallyQueuedSchedDetailIds.has(detail.id);
-                  const isLocked = detail.isMaintained || isQueued;
-                  return (
-                    <Pressable
-                      key={detail.id}
-                      style={[styles.printerRow, isLocked && styles.printerRowDone]}
-                      onPress={() => openMaintenance(detail)}
-                    >
-                      <View style={styles.printerIconWrap}>
-                        <Feather
-                          name={detail.isMaintained ? "check-circle" : isQueued ? "clock" : "printer"}
-                          size={16}
-                          color={
-                            detail.isMaintained
-                              ? theme.success
-                              : isQueued
-                              ? theme.warning
-                              : theme.primary
+          contentContainerStyle={{ gap: 16, paddingBottom: 8 }}
+          ListHeaderComponent={
+            <Text style={styles.sectionTitle}>Technical Services · Printer Itinerary</Text>
+          }
+          ListEmptyComponent={
+            <Text style={styles.subtitle}>No printer maintenance scheduled today.</Text>
+          }
+          ListFooterComponent={<SupportServicesSection />}
+          renderItem={({ item: schedule }) => {
+            const coords = coordsForSchedule(schedule);
+            return (
+              <View>
+                {/* Client header row — now carries the navigate icon, so
+                    EVERY client in the itinerary has one on duty, not
+                    just in the pre-Time-In preview. */}
+                <View style={styles.clientHeaderRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.stopClient}>{schedule.client.name}</Text>
+                    <Text style={styles.stopLocation}>{schedule.location.name}</Text>
+                  </View>
+                  <NavButton
+                    navKey={`sched-${schedule.id}`}
+                    latitude={coords?.latitude ?? null}
+                    longitude={coords?.longitude ?? null}
+                  />
+                </View>
+                <View style={{ gap: 8, marginTop: 8 }}>
+                  {schedule.scheduleDetails.map((detail) => {
+                    const isQueued = locallyQueuedSchedDetailIds.has(detail.id);
+                    const isLocked = detail.isMaintained || isQueued;
+                    return (
+                      <Pressable
+                        key={detail.id}
+                        style={[styles.printerRow, isLocked && styles.printerRowDone]}
+                        onPress={() => openMaintenance(detail)}
+                      >
+                        <View style={styles.printerIconWrap}>
+                          <Feather
+                            name={detail.isMaintained ? "check-circle" : isQueued ? "clock" : "printer"}
+                            size={16}
+                            color={
+                              detail.isMaintained
+                                ? theme.success
+                                : isQueued
+                                ? theme.warning
+                                : theme.primary
+                            }
+                          />
+                        </View>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.printerModel}>{detail.printer.model.name ?? "Printer"}</Text>
+                          <Text style={styles.printerSerial}>{detail.printer.serialNo}</Text>
+                        </View>
+                        {detail.isMaintained ? (
+                          <View style={[styles.statusBadge, styles.statusBadgeDone]}>
+                            <Text style={[styles.statusBadgeText, { color: theme.success }]}>Maintained</Text>
+                          </View>
+                        ) : isQueued ? (
+                          <View style={[styles.statusBadge, styles.statusBadgeQueued]}>
+                            <Text style={[styles.statusBadgeText, { color: theme.warning }]}>Pending Sync</Text>
+                          </View>
+                        ) : (
+                          <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
+                        )}
+                        {/* History icon. Its own hit target with
+                            stopPropagation-equivalent behaviour (a nested
+                            Pressable wins the touch over its parent in
+                            RN), so tapping history never accidentally
+                            opens the maintenance form — and it stays
+                            available on ALREADY-MAINTAINED rows too,
+                            where the row itself is locked. That's the
+                            case it's arguably most useful in: checking
+                            what was done here before. */}
+                        <Pressable
+                          style={styles.historyButton}
+                          hitSlop={8}
+                          onPress={() =>
+                            navigation.navigate("PrinterHistory", {
+                              serialNo: detail.printer.serialNo,
+                            })
                           }
-                        />
-                      </View>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.printerModel}>{detail.printer.model.name ?? "Printer"}</Text>
-                        <Text style={styles.printerSerial}>{detail.printer.serialNo}</Text>
-                      </View>
-                      {detail.isMaintained ? (
-                        <View style={[styles.statusBadge, styles.statusBadgeDone]}>
-                          <Text style={[styles.statusBadgeText, { color: theme.success }]}>Maintained</Text>
-                        </View>
-                      ) : isQueued ? (
-                        <View style={[styles.statusBadge, styles.statusBadgeQueued]}>
-                          <Text style={[styles.statusBadgeText, { color: theme.warning }]}>Pending Sync</Text>
-                        </View>
-                      ) : (
-                        <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
-                      )}
-                    </Pressable>
-                  );
-                })}
+                        >
+                          <Feather name="clock" size={16} color={theme.info} />
+                        </Pressable>
+                      </Pressable>
+                    );
+                  })}
+                </View>
               </View>
-            </View>
-          )}
+            );
+          }}
         />
       )}
       <Pressable
@@ -1028,6 +1252,45 @@ function createStyles(theme: Palette) {
       padding: 12,
     },
     printerRowDone: { opacity: 0.6 },
+    clientHeaderRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+    historyButton: {
+      width: 30,
+      height: 30,
+      borderRadius: 15,
+      backgroundColor: theme.accent,
+      alignItems: "center",
+      justifyContent: "center",
+      marginLeft: 8,
+    },
+    supportCard: {
+      flexDirection: "row",
+      alignItems: "flex-start",
+      gap: 10,
+      backgroundColor: theme.card,
+      borderRadius: theme.radius,
+      borderWidth: 1,
+      borderColor: theme.border,
+      padding: 12,
+    },
+    supportIconWrap: {
+      width: 32,
+      height: 32,
+      borderRadius: 16,
+      backgroundColor: theme.accent,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    supportTypeRow: { flexDirection: "row", marginTop: 6 },
+    supportTypeTag: {
+      color: theme.info,
+      backgroundColor: theme.accent,
+      fontSize: 11,
+      fontWeight: "700",
+      paddingHorizontal: 8,
+      paddingVertical: 3,
+      borderRadius: 999,
+      overflow: "hidden",
+    },
     statusBadge: {
       flexDirection: "row",
       alignItems: "center",
