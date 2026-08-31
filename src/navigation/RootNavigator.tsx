@@ -129,7 +129,7 @@ export function RootNavigator() {
         : err instanceof Error
         ? err.message
         : String(err);
-    return <AccountPendingScreen reason="network-error" detail={detail} />;
+    return <AccountPendingScreen reason="network-error" detail={detail} onRetry={() => statusQuery.refetch()} />;
   }
 
   const status = statusQuery.data;

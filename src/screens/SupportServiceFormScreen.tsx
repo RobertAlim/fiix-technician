@@ -51,6 +51,7 @@ import { File, Paths } from "expo-file-system";
 import { toByteArray } from "base64-js";
 
 import { useApi } from "@/hooks/useApi";
+import { useIsOnline } from "@/hooks/useIsOnline";
 import { enqueueReport } from "@/lib/offline-db";
 import { optimizeSignature } from "@/lib/image-processing";
 import { onNextCrop } from "@/lib/crop-bridge";
@@ -89,6 +90,7 @@ export function SupportServiceFormScreen() {
   const { params } = useRoute<FormRoute>();
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
   const api = useApi();
+  const isOnline = useIsOnline();
 
   // Same Android nav-bar hiding as MaintenanceFormScreen, for the same
   // reason: the system back/home/recents bar can sit on top of the Save
@@ -267,12 +269,28 @@ export function SupportServiceFormScreen() {
     );
   }
   if (detailQuery.isError || !activity) {
+    // Same distinction as MaintenanceFormScreen's printer-lookup error —
+    // DashboardScreen's prefetch (lib/prefetch.ts) warms every support
+    // service on today's list, so reaching this uncached-and-offline
+    // path means this activity wasn't part of what was prefetched
+    // (e.g. added to the schedule after the technician last had signal).
+    const offlineUncached = !isOnline && !activity;
     return (
       <View style={styles.centered}>
-        <Text style={styles.error}>Couldn't load this support activity.</Text>
-        <Pressable style={styles.secondaryButton} onPress={() => detailQuery.refetch()}>
-          <Text style={styles.secondaryButtonText}>Retry</Text>
-        </Pressable>
+        <Text style={styles.error}>
+          {offlineUncached
+            ? "You're offline and this activity hasn't been downloaded to this device yet."
+            : "Couldn't load this support activity."}
+        </Text>
+        {offlineUncached ? (
+          <Text style={styles.body}>
+            Connect to the internet once to load it — after that it stays available offline.
+          </Text>
+        ) : (
+          <Pressable style={styles.secondaryButton} onPress={() => detailQuery.refetch()}>
+            <Text style={styles.secondaryButtonText}>Retry</Text>
+          </Pressable>
+        )}
       </View>
     );
   }
@@ -405,6 +423,7 @@ function createStyles(theme: Palette) {
       backgroundColor: theme.background,
     },
     error: { color: theme.destructive, textAlign: "center" },
+    body: { color: theme.mutedForeground, textAlign: "center" },
 
     infoCard: {
       backgroundColor: theme.card,

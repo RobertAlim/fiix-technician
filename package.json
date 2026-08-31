@@ -17,7 +17,9 @@
     "@react-navigation/bottom-tabs": "^7.18.16",
     "@react-navigation/native": "^7.3.16",
     "@react-navigation/native-stack": "^7.18.8",
+    "@tanstack/query-async-storage-persister": "^5.79.0",
     "@tanstack/react-query": "^5.79.0",
+    "@tanstack/react-query-persist-client": "^5.79.0",
     "base64-js": "^1.5.1",
     "expo": "~54.0.37",
     "expo-application": "~7.0.8",
@@ -57,6 +59,6 @@
     "@types/uuid": "^10.0.0",
     "babel-plugin-module-resolver": "^5.0.2",
     "babel-preset-expo": "~54.0.12",
-    "typescript": "~5.9.2"
+    "typescript": "^5.9.2"
   }
 }

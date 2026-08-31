@@ -31,6 +31,7 @@ import { Feather } from "@expo/vector-icons";
 import { useQuery } from "@tanstack/react-query";
 
 import { useApi } from "@/hooks/useApi";
+import { useIsOnline } from "@/hooks/useIsOnline";
 import { useAppTheme } from "@/theme";
 import { Palette } from "@/theme/palettes";
 import { RootStackParamList } from "@/navigation/RootNavigator";
@@ -71,7 +72,7 @@ interface PrinterHistoryResponse {
 }
 
 /** Mirrors lib/maintenance-status.ts's "needs attention" set on the web
- *  side — these are the statuses the reference screenshot renders as a
+ *  side — these are the statuses the reference screenshots render as a
  *  red pill. Matched case-insensitively on a prefix so the parenthetical
  *  detail ("For Replacement (Printer Part)") tints the same as the bare
  *  status. If the web list grows, this is the one place to update. */
@@ -84,9 +85,22 @@ const ATTENTION_STATUS_PREFIXES = [
   "not working",
 ];
 
-function needsAttention(status: string): boolean {
+/** The second reference screenshot (X8H5297160) shows a "Resolved"
+ *  status rendered as a GREEN pill — distinct from both the red
+ *  attention pills and the neutral grey everything else got before.
+ *  Added as its own small prefix list rather than folding it into
+ *  "not attention = green" by default, since most non-attention
+ *  statuses (e.g. a plain routine visit) aren't actually a resolution
+ *  of anything and shouldn't read as one. */
+const RESOLVED_STATUS_PREFIXES = ["resolved", "completed", "fixed", "ok", "no issue"];
+
+type StatusTone = "attention" | "resolved" | "neutral";
+
+function statusTone(status: string): StatusTone {
   const s = status.trim().toLowerCase();
-  return ATTENTION_STATUS_PREFIXES.some((p) => s.startsWith(p));
+  if (ATTENTION_STATUS_PREFIXES.some((p) => s.startsWith(p))) return "attention";
+  if (RESOLVED_STATUS_PREFIXES.some((p) => s.startsWith(p))) return "resolved";
+  return "neutral";
 }
 
 export function PrinterHistoryScreen() {
@@ -94,6 +108,7 @@ export function PrinterHistoryScreen() {
   const styles = createStyles(theme);
   const { params } = useRoute<HistoryRoute>();
   const api = useApi();
+  const isOnline = useIsOnline();
 
   const historyQuery = useQuery({
     queryKey: ["printer-history", params.serialNo],
@@ -112,12 +127,26 @@ export function PrinterHistoryScreen() {
   }
 
   if (historyQuery.isError || !historyQuery.data) {
+    // Same reasoning as the other two forms: prefetchTodaysWork warms
+    // history for every printer on today's itinerary, so an uncached
+    // miss here specifically means this printer's history was looked up
+    // outside that set (e.g. scanned via QR rather than tapped from the
+    // itinerary) while offline.
+    const offlineUncached = !isOnline && !historyQuery.data;
     return (
       <View style={styles.centered}>
-        <Text style={styles.error}>Couldn't load history for {params.serialNo}.</Text>
-        <Pressable style={styles.secondaryButton} onPress={() => historyQuery.refetch()}>
-          <Text style={styles.secondaryButtonText}>Retry</Text>
-        </Pressable>
+        <Text style={styles.error}>
+          {offlineUncached
+            ? `You're offline and history for ${params.serialNo} hasn't been downloaded yet.`
+            : `Couldn't load history for ${params.serialNo}.`}
+        </Text>
+        {offlineUncached ? (
+          <Text style={styles.empty}>Connect to the internet once to load it.</Text>
+        ) : (
+          <Pressable style={styles.secondaryButton} onPress={() => historyQuery.refetch()}>
+            <Text style={styles.secondaryButtonText}>Retry</Text>
+          </Pressable>
+        )}
       </View>
     );
   }
@@ -152,12 +181,13 @@ export function PrinterHistoryScreen() {
         <Text style={styles.empty}>No maintenance has been recorded for this printer yet.</Text>
       ) : (
         history.map((record) => {
-          const attention = needsAttention(record.status);
-          const tint = attention ? theme.destructive : theme.mutedForeground;
+          const tone = statusTone(record.status);
+          const tint =
+            tone === "attention" ? theme.destructive : tone === "resolved" ? theme.success : theme.mutedForeground;
           return (
             <View
               key={record.id}
-              style={[styles.recordCard, attention && styles.recordCardAttention]}
+              style={[styles.recordCard, tone === "attention" && styles.recordCardAttention]}
             >
               <View style={styles.recordHeader}>
                 <Text style={styles.recordTechnician}>{record.technician}</Text>

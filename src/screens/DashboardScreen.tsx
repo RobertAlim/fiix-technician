@@ -26,8 +26,9 @@ import { useNavigation } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import { useApi } from "@/hooks/useApi";
 import { useOfflineSync } from "@/hooks/useOfflineSync";
-import { distanceMeters } from "@/lib/geo";
 import { openDirections } from "@/lib/maps";
+import { useGeofenceCheck, Geofence } from "@/hooks/useGeofenceCheck";
+import { prefetchTodaysWork } from "@/lib/prefetch";
 import { SupportServiceRow } from "@/types/support";
 import { useAppTheme } from "@/theme";
 import { Palette } from "@/theme/palettes";
@@ -58,6 +59,17 @@ interface AttendanceStatus {
   itinerary: ItineraryStop[];
   firstStop: ItineraryStop | null;
   geofence: { latitude: number; longitude: number; radiusMeters: number } | null;
+  // NEW — analogous to firstStop/geofence above, but for the LAST
+  // scheduled printer stop instead of the first. Backend-provided rather
+  // than derived client-side from `itinerary`'s ordering: the server is
+  // the one source of truth for "which stop is actually last today"
+  // (sequence gaps, reschedules, and same-location duplicate stops all
+  // make that non-trivial to re-derive correctly on the client), and
+  // Time Out's geofence gate needs to agree with whatever the server
+  // itself checks when it independently validates the same thing on
+  // POST /api/attendance/time-out — see the backend spec.
+  lastStop: ItineraryStop | null;
+  lastGeofence: { latitude: number; longitude: number; radiusMeters: number } | null;
   tomorrowItinerary: ItineraryStop[];
 }
 
@@ -129,16 +141,6 @@ function formatManilaTime(iso: string): string {
 // a second, redundant dialog on top of it.
 class BackgroundLocationRequiredError extends Error {}
 
-// How long to wait for a first location fix before showing an explicit
-// error instead of "Checking your location…" indefinitely.
-const LOCATION_FIX_TIMEOUT_MS = 12_000;
-
-type LocationState =
-  | { kind: "checking" }
-  | { kind: "ok"; distance: number }
-  | { kind: "permission-denied" }
-  | { kind: "timeout" };
-
 export function DashboardScreen() {
   const api = useApi();
   const queryClient = useQueryClient();
@@ -163,7 +165,6 @@ export function DashboardScreen() {
   );
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
   const [gpsBackgroundActive, setGpsBackgroundActive] = useState(false);
-  const [locationState, setLocationState] = useState<LocationState>({ kind: "checking" });
   const [showLocationDisclosure, setShowLocationDisclosure] = useState(false);
   // Time Out confirmation — see the dialog itself further down for why
   // this is a typed-word gate rather than a plain Cancel/Confirm: Time
@@ -176,7 +177,6 @@ export function DashboardScreen() {
     setShowTimeOutConfirm(false);
     setTimeOutConfirmText("");
   };
-  const watchSubRef = useRef<Location.LocationSubscription | null>(null);
 
   const statusQuery = useQuery({
     queryKey: ["attendance-status"],
@@ -226,6 +226,35 @@ export function DashboardScreen() {
       ),
     enabled: (onDuty || hasTimedOutToday) && technicianId != null,
   });
+
+  // Warms the cache for every printer/support-service FORM today's
+  // itinerary points at — see lib/prefetch.ts for why the itinerary
+  // list alone isn't enough for genuine offline usability. Guarded by a
+  // signature ref (not just a `[data]` dependency) so this fires once
+  // per actual CONTENT change rather than on every background refetch
+  // that happens to return the same rows — prefetchQuery is already
+  // cheap when data is fresh, but there's no reason to re-run the whole
+  // pass (and its console noise) on every 30s staleTime tick.
+  const prefetchedSignatureRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!offlineSync.online) return;
+    if (!scheduleQuery.data || !supportQuery.data) return;
+    const signature = JSON.stringify([
+      scheduleQuery.data.flatMap((s) => s.scheduleDetails.map((d) => d.printer.serialNo)).sort(),
+      supportQuery.data.map((r) => r.id).sort(),
+    ]);
+    if (prefetchedSignatureRef.current === signature) return;
+    prefetchedSignatureRef.current = signature;
+    prefetchTodaysWork(queryClient, api, scheduleQuery.data, supportQuery.data).catch(() => {
+      // Individual failures are already swallowed inside
+      // prefetchTodaysWork/react-query itself — this outer catch only
+      // guards against something throwing before that, and deliberately
+      // does nothing further: a failed prefetch pass just means the
+      // technician falls back to the existing per-screen live fetch
+      // when they open that form, which is exactly what happened before
+      // this feature existed.
+    });
+  }, [offlineSync.online, scheduleQuery.data, supportQuery.data, queryClient, api]);
 
   // Coordinates for the ON-DUTY printer itinerary.
   //
@@ -316,7 +345,11 @@ export function DashboardScreen() {
         {supportQuery.isLoading ? (
           <ActivityIndicator color={theme.primary} />
         ) : supportQuery.isError ? (
-          <Text style={styles.error}>Couldn't load today's support services.</Text>
+          <Text style={styles.error}>
+            {offlineSync.online
+              ? "Couldn't load today's support services."
+              : "You're offline and support services haven't been downloaded to this device yet."}
+          </Text>
         ) : rows.length === 0 ? (
           <Text style={styles.subtitle}>No support services scheduled today.</Text>
         ) : (
@@ -457,81 +490,30 @@ export function DashboardScreen() {
     );
   };
 
-  const geofence = statusQuery.data?.geofence ?? null;
+  const geofence: Geofence | null = statusQuery.data?.geofence ?? null;
+  const lastGeofence: Geofence | null = statusQuery.data?.lastGeofence ?? null;
 
-  useEffect(() => {
-    let cancelled = false;
-    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  // Time-In gate — identical behaviour to before, now via the shared
+  // hook. Only watches while NOT on duty and NOT already timed out today
+  // (there's nothing to gate once the shift has started or ended).
+  const timeInCheck = useGeofenceCheck(geofence, !onDuty && !hasTimedOutToday);
+  const locationState = timeInCheck.state;
+  const withinRange = timeInCheck.withinRange;
 
-    async function start() {
-      // Also skip once the shift is over — there's no Time In pill to
-      // feed once the Dashboard has switched to the locked Shift
-      // Complete summary, so continuing to watch position here would
-      // just be a pointless battery draw.
-      if (onDuty || hasTimedOutToday || !geofence) return;
-      setLocationState({ kind: "checking" });
-
-      const perm = await Location.requestForegroundPermissionsAsync();
-      if (cancelled) return;
-      if (perm.status !== "granted") {
-        setLocationState({ kind: "permission-denied" });
-        return;
-      }
-
-      // Timeout guard: if neither the one-shot fix below nor the watch's
-      // first callback lands within this window, tell the technician
-      // plainly instead of leaving "Checking…" up forever.
-      timeoutHandle = setTimeout(() => {
-        if (!cancelled) setLocationState((prev) => (prev.kind === "checking" ? { kind: "timeout" } : prev));
-      }, LOCATION_FIX_TIMEOUT_MS);
-
-      const applyFix = (lat: number, lon: number) => {
-        if (cancelled) return;
-        if (timeoutHandle) clearTimeout(timeoutHandle);
-        setLocationState({ kind: "ok", distance: distanceMeters(lat, lon, geofence.latitude, geofence.longitude) });
-      };
-
-      // Try an immediate one-shot fix first — often resolves faster than
-      // waiting on watchPositionAsync's first tick, and gives a result
-      // even on devices where the watch is slow to start.
-      try {
-        const fix = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-        applyFix(fix.coords.latitude, fix.coords.longitude);
-      } catch {
-        // Fall through — the watch below is the real ongoing source; a
-        // failed one-shot isn't fatal on its own.
-      }
-
-      watchSubRef.current = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.Balanced, timeInterval: 4000, distanceInterval: 5 },
-        (fix) => applyFix(fix.coords.latitude, fix.coords.longitude)
-      );
-    }
-
-    start();
-    return () => {
-      cancelled = true;
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      watchSubRef.current?.remove();
-      watchSubRef.current = null;
-    };
-  }, [onDuty, hasTimedOutToday, geofence?.latitude, geofence?.longitude]);
-
-  useEffect(() => {
-    console.log(`[gps] onDuty effect: onDuty=${onDuty} gpsBackgroundActive=${gpsBackgroundActive}`);
-    if (onDuty && !gpsBackgroundActive) {
-      startBackgroundGpsReporting()
-        .then(() => setGpsBackgroundActive(true))
-        .catch((err) =>
-          console.log("[gps] failed to start background reporting from Dashboard effect", err)
-        );
-    } else if (!onDuty && gpsBackgroundActive) {
-      stopBackgroundGpsReporting().then(() => setGpsBackgroundActive(false));
-    }
-  }, [onDuty, gpsBackgroundActive]);
-
-  const withinRange =
-    geofence != null && locationState.kind === "ok" && locationState.distance <= geofence.radiusMeters;
+  // Time-Out gate — the new counterpart, watching against the LAST
+  // itinerary stop's geofence instead of the first, and only while
+  // actually on duty (there's nothing to check before Time In or after
+  // Time Out has already locked the Dashboard). This is a UX aid, not
+  // the actual security boundary: a technician's device reporting "in
+  // range" only disables/enables this button locally, so it can be
+  // bypassed by a compromised or spoofed client. The real enforcement is
+  // POST /api/attendance/time-out independently re-checking the
+  // technician's server-recorded position against the same last-stop
+  // geofence and rejecting the request outright if it disagrees — see
+  // the backend spec. This client-side gate exists so a technician who
+  // is genuinely out of range gets a clear, immediate reason rather than
+  // an opaque rejection after tapping through the confirm dialog.
+  const timeOutCheck = useGeofenceCheck(lastGeofence, onDuty);
 
   const timeInMutation = useMutation({
     mutationFn: async () => {
@@ -625,9 +607,20 @@ export function DashboardScreen() {
   }
 
   if (statusQuery.isError) {
+    // With the AsyncStorage query persister (App.tsx) now in place, this
+    // branch should rarely fire past a technician's very first session —
+    // any prior successful load stays available (and status stays
+    // "success", not "error") across restarts and offline periods. What
+    // this actually catches now is closer to "never had a successful
+    // load on this device at all," which genuinely does need connectivity
+    // once — there's nothing to fall back to.
     return (
       <View style={styles.centered}>
-        <Text style={styles.error}>Couldn't reach the server. Check your connection.</Text>
+        <Text style={styles.error}>
+          {offlineSync.online
+            ? "Couldn't reach the server. Check your connection."
+            : "You're offline, and this device hasn't loaded your schedule before. Connect once to get started — after that it stays available offline."}
+        </Text>
         <Pressable style={styles.secondaryButton} onPress={() => statusQuery.refetch()}>
           <Text style={styles.secondaryButtonText}>Retry</Text>
         </Pressable>
@@ -637,8 +630,16 @@ export function DashboardScreen() {
 
   const data = statusQuery.data!;
 
-  const renderRangePill = () => {
-    if (locationState.kind === "permission-denied") {
+  // Generalized so both the Time-In pill and the new Time-Out pill
+  // render from one implementation — behaviour is identical to before
+  // for Time In, just parameterized instead of closing over the
+  // module-level `locationState`/`geofence`/`withinRange` directly.
+  const renderRangePillFor = (
+    check: { state: import("@/hooks/useGeofenceCheck").GeofenceCheckState; withinRange: boolean },
+    targetGeofence: Geofence | null,
+    inRangeLabel: string
+  ) => {
+    if (check.state.kind === "permission-denied") {
       return (
         <View style={[styles.rangePill, styles.rangePillOut]}>
           <Feather name="alert-triangle" size={13} color={theme.warning} />
@@ -648,7 +649,7 @@ export function DashboardScreen() {
         </View>
       );
     }
-    if (locationState.kind === "timeout") {
+    if (check.state.kind === "timeout") {
       return (
         <View style={[styles.rangePill, styles.rangePillOut]}>
           <Feather name="alert-triangle" size={13} color={theme.warning} />
@@ -658,7 +659,7 @@ export function DashboardScreen() {
         </View>
       );
     }
-    if (locationState.kind === "checking") {
+    if (check.state.kind === "checking") {
       return (
         <View style={[styles.rangePill, styles.rangePillOut]}>
           <Feather name="navigation" size={13} color={theme.warning} />
@@ -667,20 +668,22 @@ export function DashboardScreen() {
       );
     }
     return (
-      <View style={[styles.rangePill, withinRange ? styles.rangePillOk : styles.rangePillOut]}>
+      <View style={[styles.rangePill, check.withinRange ? styles.rangePillOk : styles.rangePillOut]}>
         <Feather
-          name={withinRange ? "check-circle" : "navigation"}
+          name={check.withinRange ? "check-circle" : "navigation"}
           size={13}
-          color={withinRange ? theme.primary : theme.warning}
+          color={check.withinRange ? theme.primary : theme.warning}
         />
-        <Text style={[styles.rangePillText, { color: withinRange ? theme.primary : theme.warning }]}>
-          {withinRange
-            ? "You're within range"
-            : `${Math.round(locationState.distance)}m away — need to be within ${geofence?.radiusMeters}m`}
+        <Text style={[styles.rangePillText, { color: check.withinRange ? theme.primary : theme.warning }]}>
+          {check.withinRange
+            ? inRangeLabel
+            : `${Math.round(check.state.distance)}m away — need to be within ${targetGeofence?.radiusMeters}m`}
         </Text>
       </View>
     );
   };
+
+  const renderRangePill = () => renderRangePillFor(timeInCheck, geofence, "You're within range");
 
   // Shift Complete — replaces the entire Dashboard (not just a disabled
   // Time In button) once today's session has a timeOut. This is what
@@ -738,7 +741,11 @@ export function DashboardScreen() {
         {scheduleQuery.isLoading ? (
           <ActivityIndicator color={theme.primary} />
         ) : scheduleQuery.isError ? (
-          <Text style={styles.error}>Couldn't load today's summary.</Text>
+          <Text style={styles.error}>
+            {offlineSync.online
+              ? "Couldn't load today's summary."
+              : "You're offline and today's summary hasn't been downloaded to this device yet."}
+          </Text>
         ) : allDetails.length === 0 ? (
           <Text style={styles.subtitle}>You had no scheduled visits today.</Text>
         ) : (
@@ -953,7 +960,11 @@ export function DashboardScreen() {
       {scheduleQuery.isLoading ? (
         <ActivityIndicator color={theme.primary} />
       ) : scheduleQuery.isError ? (
-        <Text style={styles.error}>Couldn't load today's printers.</Text>
+        <Text style={styles.error}>
+          {offlineSync.online
+            ? "Couldn't load today's printers."
+            : "You're offline and today's printers haven't been downloaded to this device yet."}
+        </Text>
       ) : (
         <FlatList
           data={scheduleQuery.data ?? []}
@@ -1051,10 +1062,22 @@ export function DashboardScreen() {
           }}
         />
       )}
+      {/* Time Out geofence gate. lastGeofence coming back null (no
+          geofence configured on the last stop) is treated as "can't
+          verify, so don't allow it" rather than silently letting Time
+          Out through unchecked — matching AttendanceGate's existing
+          fail-closed philosophy elsewhere in this app: the geofence
+          check must be positively satisfied, never assumed passing by
+          default just because data was missing. */}
+      {lastGeofence && renderRangePillFor(timeOutCheck, lastGeofence, "You're within range to time out")}
       <Pressable
-        style={[styles.primaryButton, styles.timeOutButton]}
+        style={[
+          styles.primaryButton,
+          styles.timeOutButton,
+          !timeOutCheck.withinRange && styles.primaryButtonDisabled,
+        ]}
         onPress={() => setShowTimeOutConfirm(true)}
-        disabled={timeOutMutation.isPending}
+        disabled={!timeOutCheck.withinRange || timeOutMutation.isPending}
       >
         {timeOutMutation.isPending ? (
           <ActivityIndicator color="#fff" />
@@ -1062,6 +1085,12 @@ export function DashboardScreen() {
           <Text style={[styles.primaryButtonText, { color: "#fff" }]}>Time Out</Text>
         )}
       </Pressable>
+      {!lastGeofence && (
+        <Text style={styles.geofenceMissingNote}>
+          No location is on file for your last scheduled stop today, so Time Out can't be
+          verified from here yet. Contact your Scheduler.
+        </Text>
+      )}
 
       {/* Matches the design you sent: title + close X top-right, plain
           body copy, Cancel / destructive-action pills bottom-right. The
@@ -1180,6 +1209,12 @@ function createStyles(theme: Palette) {
     primaryButtonDisabled: { backgroundColor: theme.muted },
     primaryButtonText: { color: theme.primaryForeground, fontWeight: "700", fontSize: 16 },
     timeOutButton: { backgroundColor: theme.destructive, marginTop: 16 },
+    geofenceMissingNote: {
+      color: theme.mutedForeground,
+      fontSize: 12,
+      textAlign: "center",
+      marginTop: 8,
+    },
 
     secondaryButton: {
       borderWidth: 1,

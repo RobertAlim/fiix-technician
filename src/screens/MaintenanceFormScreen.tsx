@@ -49,6 +49,7 @@ import { File, Paths } from "expo-file-system";
 import { toByteArray } from "base64-js";
 
 import { useApi } from "@/hooks/useApi";
+import { useIsOnline } from "@/hooks/useIsOnline";
 import { enqueueReport } from "@/lib/offline-db";
 import { optimizeSignature } from "@/lib/image-processing";
 import { onNextScan } from "@/lib/scan-bridge";
@@ -110,6 +111,7 @@ export function MaintenanceFormScreen() {
   const { params } = useRoute<FormRoute>();
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
   const api = useApi();
+  const isOnline = useIsOnline();
   const sigRef = React.useRef<SignatureViewRef>(null);
 
   // Hides Android's system nav bar (back/home/recents) specifically while
@@ -461,12 +463,32 @@ export function MaintenanceFormScreen() {
     );
   }
   if (printerQuery.isError || !printerQuery.data) {
+    // Distinguishes two genuinely different situations that used to
+    // show the identical unhelpful message: a real server/network
+    // problem (worth retrying right now) versus simply never having
+    // downloaded this printer while online (DashboardScreen's prefetch
+    // — see lib/prefetch.ts — covers every printer on today's
+    // itinerary, so this path is really only reached for a printer
+    // scanned outside today's assigned stops). The technician needs a
+    // different action for each: retry vs. "go find signal."
+    const offlineUncached = !isOnline && !printerQuery.data;
     return (
       <View style={styles.centered}>
-        <Text style={styles.error}>Couldn't load printer details for {params.serialNo}.</Text>
-        <Pressable style={styles.secondaryButton} onPress={() => printerQuery.refetch()}>
-          <Text style={styles.secondaryButtonText}>Retry</Text>
-        </Pressable>
+        <Text style={styles.error}>
+          {offlineUncached
+            ? `You're offline and ${params.serialNo} hasn't been downloaded to this device yet.`
+            : `Couldn't load printer details for ${params.serialNo}.`}
+        </Text>
+        {offlineUncached ? (
+          <Text style={styles.body}>
+            Connect to the internet once — printers on today's itinerary download automatically,
+            so this only affects a printer outside today's assigned stops.
+          </Text>
+        ) : (
+          <Pressable style={styles.secondaryButton} onPress={() => printerQuery.refetch()}>
+            <Text style={styles.secondaryButtonText}>Retry</Text>
+          </Pressable>
+        )}
       </View>
     );
   }
