@@ -32,6 +32,7 @@ import { useQuery } from "@tanstack/react-query";
 
 import { useApi } from "@/hooks/useApi";
 import { useIsOnline } from "@/hooks/useIsOnline";
+import { ApiError } from "@/lib/api";
 import { useAppTheme } from "@/theme";
 import { Palette } from "@/theme/palettes";
 import { RootStackParamList } from "@/navigation/RootNavigator";
@@ -133,6 +134,19 @@ export function PrinterHistoryScreen() {
     // outside that set (e.g. scanned via QR rather than tapped from the
     // itinerary) while offline.
     const offlineUncached = !isOnline && !historyQuery.data;
+    // Surfaces the ACTUAL failure (status code + URL) rather than just
+    // "Couldn't load history" — this screen's most likely failure mode
+    // right now is GET /api/printer-history not existing server-side yet
+    // (a 404), which looks identical to a generic network hiccup unless
+    // the real status is visible. Same pattern RootNavigator's
+    // AccountPendingScreen already uses for its own network-error case.
+    const err = historyQuery.error;
+    const detail =
+      !offlineUncached && err instanceof ApiError
+        ? `HTTP ${err.status} — ${err.url}`
+        : !offlineUncached && err instanceof Error
+        ? err.message
+        : null;
     return (
       <View style={styles.centered}>
         <Text style={styles.error}>
@@ -140,6 +154,7 @@ export function PrinterHistoryScreen() {
             ? `You're offline and history for ${params.serialNo} hasn't been downloaded yet.`
             : `Couldn't load history for ${params.serialNo}.`}
         </Text>
+        {detail ? <Text style={styles.detail}>{detail}</Text> : null}
         {offlineUncached ? (
           <Text style={styles.empty}>Connect to the internet once to load it.</Text>
         ) : (
@@ -256,6 +271,14 @@ function createStyles(theme: Palette) {
       backgroundColor: theme.background,
     },
     error: { color: theme.destructive, textAlign: "center" },
+    detail: {
+      textAlign: "center",
+      color: theme.mutedForeground,
+      fontFamily: "monospace",
+      fontSize: 12,
+      paddingHorizontal: 8,
+      opacity: 0.7,
+    },
 
     titleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
     title: { color: theme.foreground, fontSize: 18, fontWeight: "800" },

@@ -112,6 +112,17 @@ interface ScheduleRow {
   client: { name: string };
   location: { name: string };
   scheduleDetails: ScheduleDetailRow[];
+  // NEW — see the backend spec accompanying this delta. Read directly
+  // off THIS row rather than cross-referenced from a different endpoint
+  // (which is what the old `itineraryCoords`/`coordsForSchedule` join
+  // against `/api/attendance/status`'s itinerary did, matching only by
+  // schedule id or, failing that, a fragile location-NAME string
+  // compare). That join had no guaranteed shared identifier between the
+  // two responses and is the suspected cause of the location icon going
+  // missing for some itineraries — a same-row field can't silently
+  // mismatch the way a cross-endpoint join can.
+  latitude: number | null;
+  longitude: number | null;
 }
 
 /** "yyyy-MM-dd" in Asia/Manila regardless of the device's own timezone —
@@ -256,39 +267,34 @@ export function DashboardScreen() {
     });
   }, [offlineSync.online, scheduleQuery.data, supportQuery.data, queryClient, api]);
 
-  // Coordinates for the ON-DUTY printer itinerary.
+  // Technical vs. Support Services classification — automatic, based
+  // purely on whether a schedule actually has any printer assigned to
+  // it (scheduleDetails.length), NOT on which endpoint/table it came
+  // from. This matters because a `schedules` row with zero
+  // scheduleDetails is a real, valid shape (a Scheduler can create an
+  // itinerary stop with a client/location/notes and never attach a
+  // printer to it) — and until now, EVERY row from GET /api/schedule
+  // rendered under "Technical Services" regardless, which is exactly
+  // the misclassification reported: a client visit with no printer
+  // showing up under the printer-itinerary header, with nothing
+  // beneath it once rendered (its scheduleDetails.map produced zero
+  // rows), looking like an empty/broken entry rather than what it
+  // actually was.
   //
-  // Worth understanding rather than skimming: the on-duty list is
-  // rendered from GET /api/schedule (the per-PRINTER breakdown), whose
-  // rows carry NO coordinates — only /api/attendance/status's itinerary
-  // does, and it already does, because the pre-Time-In preview needed
-  // them. Both are keyed by the same schedules.id, so joining them here
-  // gives every on-duty client stop a navigate icon with ZERO backend
-  // change, instead of adding lat/lng to a second route.
-  //
-  // The fallback path matters: /api/schedule and /api/attendance/status
-  // derive "today" independently, so if they ever disagree (or the
-  // attendance payload is trimmed later), a schedule id might be absent
-  // from the map. Rather than silently dropping the icon, it falls back
-  // to matching on locationId — the coordinate belongs to the LOCATION
-  // in locationGeofences, not to the schedule, so any stop at the same
-  // location is a correct source for it.
-  const itineraryCoords = React.useMemo(() => {
-    const byScheduleId = new Map<number, { latitude: number; longitude: number }>();
-    const byLocationName = new Map<string, { latitude: number; longitude: number }>();
-    for (const stop of statusQuery.data?.itinerary ?? []) {
-      if (stop.latitude == null || stop.longitude == null) continue;
-      const coord = { latitude: stop.latitude, longitude: stop.longitude };
-      byScheduleId.set(stop.id, coord);
-      byLocationName.set(stop.location, coord);
-    }
-    return { byScheduleId, byLocationName };
-  }, [statusQuery.data?.itinerary]);
-
-  const coordsForSchedule = (schedule: ScheduleRow) =>
-    itineraryCoords.byScheduleId.get(schedule.id) ??
-    itineraryCoords.byLocationName.get(schedule.location.name) ??
-    null;
+  // This is independent of — and in addition to — the dedicated
+  // `supportServices` table (supportQuery below): a schedule with no
+  // printer is reclassified for DISPLAY purposes even though it isn't
+  // literally a `supportServices` row, because from the technician's
+  // point of view "no printer to maintain here" belongs under Support
+  // Services either way.
+  const printerSchedules = React.useMemo(
+    () => (scheduleQuery.data ?? []).filter((s) => s.scheduleDetails.length > 0),
+    [scheduleQuery.data]
+  );
+  const noPrinterSchedules = React.useMemo(
+    () => (scheduleQuery.data ?? []).filter((s) => s.scheduleDetails.length === 0),
+    [scheduleQuery.data]
+  );
 
   // supportServices ids with a submission already sitting in the local
   // offline queue. Exactly the same "don't let them file it twice"
@@ -339,6 +345,7 @@ export function DashboardScreen() {
    *  end-of-shift picture. */
   const SupportServicesSection = ({ readOnly = false }: { readOnly?: boolean }) => {
     const rows = supportQuery.data ?? [];
+    const totalCount = rows.length + noPrinterSchedules.length;
     return (
       <View style={{ marginTop: 8 }}>
         <Text style={styles.sectionTitle}>Support Services</Text>
@@ -350,7 +357,7 @@ export function DashboardScreen() {
               ? "Couldn't load today's support services."
               : "You're offline and support services haven't been downloaded to this device yet."}
           </Text>
-        ) : rows.length === 0 ? (
+        ) : totalCount === 0 ? (
           <Text style={styles.subtitle}>No support services scheduled today.</Text>
         ) : (
           <View style={{ gap: 10 }}>
@@ -368,7 +375,7 @@ export function DashboardScreen() {
               const locked = row.status != null || isQueued;
               return (
                 <Pressable
-                  key={row.id}
+                  key={`support-${row.id}`}
                   style={[styles.supportCard, locked && styles.printerRowDone]}
                   onPress={readOnly ? undefined : () => openSupportService(row)}
                   disabled={readOnly}
@@ -411,6 +418,42 @@ export function DashboardScreen() {
                 </Pressable>
               );
             })}
+
+            {/* Reclassified schedules — real `schedules` rows with no
+                printer attached, automatically routed here instead of
+                Technical Services (see printerSchedules/noPrinterSchedules
+                above). Deliberately NOT pressable/no chevron: there is no
+                existing completion action for a printer-less schedule
+                (no supportServiceTypeId, no status column, no
+                photo/signature contract the way a real `supportServices`
+                row has) — this card is informational plus navigation
+                only, not a stand-in for the real thing. If technicians
+                need to formally complete these the same way, that's a
+                product/backend decision — see this delta's notes. */}
+            {noPrinterSchedules.map((schedule) => (
+              <View key={`sched-${schedule.id}`} style={styles.supportCard}>
+                <View style={styles.supportIconWrap}>
+                  <Feather name="map-pin" size={16} color={theme.mutedForeground} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.stopClient}>{schedule.client.name}</Text>
+                  <Text style={styles.stopLocation}>{schedule.location.name}</Text>
+                  <View style={styles.supportTypeRow}>
+                    <Text style={[styles.supportTypeTag, styles.noPrinterTag]}>
+                      No printer assigned
+                    </Text>
+                  </View>
+                  {schedule.notes ? <Text style={styles.notes}>{schedule.notes}</Text> : null}
+                </View>
+                {!readOnly && (
+                  <NavButton
+                    navKey={`sched-${schedule.id}`}
+                    latitude={schedule.latitude}
+                    longitude={schedule.longitude}
+                  />
+                )}
+              </View>
+            ))}
           </View>
         )}
       </View>
@@ -491,7 +534,50 @@ export function DashboardScreen() {
   };
 
   const geofence: Geofence | null = statusQuery.data?.geofence ?? null;
-  const lastGeofence: Geofence | null = statusQuery.data?.lastGeofence ?? null;
+
+  // lastGeofence itself (see AttendanceStatus type above) is a field I
+  // speced as a NEW backend addition in BACKEND-SPEC-delta-003.md —
+  // never confirmed as actually implemented server-side. If the backend
+  // hasn't shipped it yet, `statusQuery.data?.lastGeofence` is simply
+  // `undefined` in the real response, and `?? null` below makes that
+  // indistinguishable from "genuinely no pin configured" — which is
+  // exactly the false "No location is on file" block a technician can
+  // hit while standing right on a real, correctly-configured pin.
+  //
+  // Fallback: derive it from `itinerary`, which — unlike lastGeofence —
+  // IS pre-existing, real, already-working data (it's what powers the
+  // pre-Time-In preview's own navigate icons, confirmed present before
+  // any of this session's changes). Sorted by `sequence` defensively
+  // (nulls last) rather than trusting raw array order, then take the
+  // actual last entry — not the last entry that HAS a pin, since
+  // falling back to an earlier stop's coordinates would validate Time
+  // Out against the wrong location, which is worse than correctly
+  // reporting "the real last stop has no pin."
+  //
+  // radiusMeters isn't part of an itinerary stop, so this reuses the
+  // Time-In geofence's own radius as a stand-in (same on-site policy
+  // presumably applies to every stop) rather than inventing an
+  // arbitrary constant.
+  const derivedLastStop = React.useMemo(() => {
+    const itinerary = statusQuery.data?.itinerary ?? [];
+    if (itinerary.length === 0) return null;
+    const sorted = [...itinerary].sort((a, b) => {
+      if (a.sequence == null) return 1;
+      if (b.sequence == null) return -1;
+      return a.sequence - b.sequence;
+    });
+    return sorted[sorted.length - 1];
+  }, [statusQuery.data?.itinerary]);
+
+  const lastGeofence: Geofence | null =
+    statusQuery.data?.lastGeofence ??
+    (derivedLastStop?.latitude != null && derivedLastStop.longitude != null
+      ? {
+          latitude: derivedLastStop.latitude,
+          longitude: derivedLastStop.longitude,
+          radiusMeters: geofence?.radiusMeters ?? 100,
+        }
+      : null);
 
   // Time-In gate — identical behaviour to before, now via the shared
   // hook. Only watches while NOT on duty and NOT already timed out today
@@ -747,9 +833,9 @@ export function DashboardScreen() {
               : "You're offline and today's summary hasn't been downloaded to this device yet."}
           </Text>
         ) : allDetails.length === 0 ? (
-          <Text style={styles.subtitle}>You had no scheduled visits today.</Text>
+          <Text style={styles.subtitle}>No printer maintenance was scheduled today.</Text>
         ) : (
-          (scheduleQuery.data ?? []).map((schedule) => (
+          printerSchedules.map((schedule) => (
             <View key={schedule.id} style={{ marginBottom: 16 }}>
               <Text style={styles.stopClient}>{schedule.client.name}</Text>
               <Text style={styles.stopLocation}>{schedule.location.name}</Text>
@@ -967,7 +1053,7 @@ export function DashboardScreen() {
         </Text>
       ) : (
         <FlatList
-          data={scheduleQuery.data ?? []}
+          data={printerSchedules}
           keyExtractor={(s) => String(s.id)}
           contentContainerStyle={{ gap: 16, paddingBottom: 8 }}
           ListHeaderComponent={
@@ -978,12 +1064,14 @@ export function DashboardScreen() {
           }
           ListFooterComponent={<SupportServicesSection />}
           renderItem={({ item: schedule }) => {
-            const coords = coordsForSchedule(schedule);
             return (
               <View>
                 {/* Client header row — now carries the navigate icon, so
                     EVERY client in the itinerary has one on duty, not
-                    just in the pre-Time-In preview. */}
+                    just in the pre-Time-In preview. Coordinates come
+                    straight off this same row (schedule.latitude/
+                    longitude) rather than a cross-endpoint lookup — see
+                    the ScheduleRow type comment for why that changed. */}
                 <View style={styles.clientHeaderRow}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.stopClient}>{schedule.client.name}</Text>
@@ -991,8 +1079,8 @@ export function DashboardScreen() {
                   </View>
                   <NavButton
                     navKey={`sched-${schedule.id}`}
-                    latitude={coords?.latitude ?? null}
-                    longitude={coords?.longitude ?? null}
+                    latitude={schedule.latitude}
+                    longitude={schedule.longitude}
                   />
                 </View>
                 <View style={{ gap: 8, marginTop: 8 }}>
@@ -1326,6 +1414,11 @@ function createStyles(theme: Palette) {
       borderRadius: 999,
       overflow: "hidden",
     },
+    // Deliberately muted rather than the info-blue every real support-
+    // service-type tag uses — this pill is naming an ABSENCE (no
+    // printer), not a category, and shouldn't visually compete with the
+    // genuine type tags for attention.
+    noPrinterTag: { color: theme.mutedForeground, backgroundColor: theme.border },
     statusBadge: {
       flexDirection: "row",
       alignItems: "center",

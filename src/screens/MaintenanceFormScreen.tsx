@@ -50,6 +50,7 @@ import { toByteArray } from "base64-js";
 
 import { useApi } from "@/hooks/useApi";
 import { useIsOnline } from "@/hooks/useIsOnline";
+import { ApiError } from "@/lib/api";
 import { enqueueReport } from "@/lib/offline-db";
 import { optimizeSignature } from "@/lib/image-processing";
 import { onNextScan } from "@/lib/scan-bridge";
@@ -472,6 +473,13 @@ export function MaintenanceFormScreen() {
     // scanned outside today's assigned stops). The technician needs a
     // different action for each: retry vs. "go find signal."
     const offlineUncached = !isOnline && !printerQuery.data;
+    const err = printerQuery.error;
+    const detail =
+      !offlineUncached && err instanceof ApiError
+        ? `HTTP ${err.status} — ${err.url}`
+        : !offlineUncached && err instanceof Error
+        ? err.message
+        : null;
     return (
       <View style={styles.centered}>
         <Text style={styles.error}>
@@ -479,6 +487,7 @@ export function MaintenanceFormScreen() {
             ? `You're offline and ${params.serialNo} hasn't been downloaded to this device yet.`
             : `Couldn't load printer details for ${params.serialNo}.`}
         </Text>
+        {detail ? <Text style={styles.detail}>{detail}</Text> : null}
         {offlineUncached ? (
           <Text style={styles.body}>
             Connect to the internet once — printers on today's itinerary download automatically,
@@ -613,7 +622,27 @@ export function MaintenanceFormScreen() {
         placeholderTextColor={theme.mutedForeground}
       />
 
-      <Text style={styles.label}>Print Count</Text>
+      <View style={styles.labelRow}>
+        <Text style={styles.label}>Print Count</Text>
+        {/* Reference-only badge, beside the label rather than a hint
+            line below the input — the request specifically asked for a
+            badge, and this reads at a glance the same moment the
+            technician looks at the field's label, before they've even
+            focused the input. Pulled from the SAME `/api/maintain?serialNo=`
+            response the form already fetches (lastPrintCount below,
+            unchanged) — no new endpoint, no new field, purely a UI
+            change. Never rendered as editable: it's a Text pill, not an
+            input, and nothing in `save()` reads from it — the printer's
+            CURRENT count is still exactly what the input below submits. */}
+        {lastPrintCount != null && (
+          <View style={styles.lastCountBadge}>
+            <Feather name="clock" size={11} color={theme.info} />
+            <Text style={styles.lastCountBadgeText}>
+              Last Maintenance: {lastPrintCount.toLocaleString("en-US")}
+            </Text>
+          </View>
+        )}
+      </View>
       <TextInput
         style={styles.printCountInput}
         value={printCountDisplay}
@@ -622,11 +651,6 @@ export function MaintenanceFormScreen() {
         placeholder="0"
         placeholderTextColor={theme.mutedForeground}
       />
-      {lastPrintCount != null && (
-        <Text style={styles.printCountHint}>
-          Last recorded: {lastPrintCount.toLocaleString("en-US")}
-        </Text>
-      )}
 
       <Text style={styles.label}>Status</Text>
       <View style={styles.chipRow}>
@@ -783,6 +807,14 @@ function createStyles(theme: Palette) {
     },
     error: { color: theme.destructive, textAlign: "center" },
     body: { color: theme.mutedForeground },
+    detail: {
+      textAlign: "center",
+      color: theme.mutedForeground,
+      fontFamily: "monospace",
+      fontSize: 12,
+      paddingHorizontal: 8,
+      opacity: 0.7,
+    },
 
     infoCard: {
       backgroundColor: theme.card,
@@ -942,6 +974,22 @@ function createStyles(theme: Palette) {
       fontWeight: "800",
       textAlignVertical: "center",
     },
-    printCountHint: { color: theme.mutedForeground, fontSize: 12, marginTop: 4 },
+    labelRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      flexWrap: "wrap",
+      gap: 6,
+    },
+    lastCountBadge: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 5,
+      backgroundColor: theme.accent,
+      borderRadius: 999,
+      paddingHorizontal: 10,
+      paddingVertical: 4,
+    },
+    lastCountBadgeText: { color: theme.info, fontSize: 11, fontWeight: "700" },
   });
 }

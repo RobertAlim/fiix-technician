@@ -52,6 +52,7 @@ import { toByteArray } from "base64-js";
 
 import { useApi } from "@/hooks/useApi";
 import { useIsOnline } from "@/hooks/useIsOnline";
+import { ApiError } from "@/lib/api";
 import { enqueueReport } from "@/lib/offline-db";
 import { optimizeSignature } from "@/lib/image-processing";
 import { onNextCrop } from "@/lib/crop-bridge";
@@ -275,6 +276,13 @@ export function SupportServiceFormScreen() {
     // path means this activity wasn't part of what was prefetched
     // (e.g. added to the schedule after the technician last had signal).
     const offlineUncached = !isOnline && !activity;
+    const err = detailQuery.error;
+    const detail =
+      !offlineUncached && err instanceof ApiError
+        ? `HTTP ${err.status} — ${err.url}`
+        : !offlineUncached && err instanceof Error
+        ? err.message
+        : null;
     return (
       <View style={styles.centered}>
         <Text style={styles.error}>
@@ -282,6 +290,7 @@ export function SupportServiceFormScreen() {
             ? "You're offline and this activity hasn't been downloaded to this device yet."
             : "Couldn't load this support activity."}
         </Text>
+        {detail ? <Text style={styles.detail}>{detail}</Text> : null}
         {offlineUncached ? (
           <Text style={styles.body}>
             Connect to the internet once to load it — after that it stays available offline.
@@ -424,6 +433,14 @@ function createStyles(theme: Palette) {
     },
     error: { color: theme.destructive, textAlign: "center" },
     body: { color: theme.mutedForeground, textAlign: "center" },
+    detail: {
+      textAlign: "center",
+      color: theme.mutedForeground,
+      fontFamily: "monospace",
+      fontSize: 12,
+      paddingHorizontal: 8,
+      opacity: 0.7,
+    },
 
     infoCard: {
       backgroundColor: theme.card,
