@@ -59,9 +59,19 @@ export const SUPPORT_SERVICE_STATUSES: SupportServiceStatus[] = ["Achieved", "No
 /** Body of POST /api/support-services/complete, built by
  *  SupportServiceFormScreen and replayed verbatim by sync-engine.ts on
  *  every retry. `photoPath`/`signPath` are filled in by the sync engine
- *  after the R2 uploads succeed, not by the form. */
+ *  after the R2 uploads succeed, not by the form.
+ *
+ *  Exactly ONE of `supportServiceId`/`scheduleId` is set, matching the
+ *  backend's exactly-one-of validation:
+ *   - `supportServiceId`: completing a Scheduler-created Support Service
+ *     row that already exists.
+ *   - `scheduleId`: documenting a printer-less `schedules` row for the
+ *     FIRST time — the "a Schedule was set for a client but no printer
+ *     itinerary selected" case. No supportServices row exists yet; the
+ *     backend creates one and links it back via scheduleId. */
 export interface SupportServiceSubmission {
-  supportServiceId: number;
+  supportServiceId?: number;
+  scheduleId?: number;
   supportServiceTypeId: number;
   clientId: number;
   locationId: number;

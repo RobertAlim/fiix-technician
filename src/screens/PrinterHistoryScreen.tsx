@@ -43,12 +43,18 @@ interface HistoryRecord {
   id: number;
   technician: string;
   status: string;
-  /** The client this printer was deployed to AT THE TIME of that visit —
-   *  deliberately not the printer's current client. A transferred printer
-   *  keeps its old reports pointing at the old client (see the web app's
-   *  Printer Transfer, which retires the deployment rather than rewriting
-   *  history), and this column is what makes that visible. */
-  clientAtMaintenance: string;
+  /** The client/location this printer was deployed to AT THE TIME of that
+   *  visit — deliberately not the printer's current client. A transferred
+   *  printer keeps its old reports pointing at the old client (see the web
+   *  app's Printer Transfer, which retires the deployment rather than
+   *  rewriting history), and these are what make that visible. Field
+   *  names (`client`/`location`, not `clientAtMaintenance`) match the
+   *  real backend route (app/api/printer-history/route.ts) exactly, which
+   *  itself matches the web app's own PrinterHistoryDialog.tsx contract —
+   *  kept in lockstep deliberately rather than renamed to something more
+   *  mobile-specific. */
+  client: string | null;
+  location: string | null;
   notes: string | null;
   /** Pre-formatted "Replacement/Repair" summary — the web modal shows an
    *  em dash when there's nothing, which this mirrors. */
@@ -211,7 +217,11 @@ export function PrinterHistoryScreen() {
               <View style={[styles.statusPill, { borderColor: tint, backgroundColor: `${tint}1a` }]}>
                 <Text style={[styles.statusPillText, { color: tint }]}>{record.status}</Text>
               </View>
-              <RecordField label="Client at Maintenance" value={record.clientAtMaintenance} theme={theme} />
+              <RecordField
+                label="Client at Maintenance"
+                value={record.client ?? "—"}
+                theme={theme}
+              />
               <RecordField label="Notes" value={record.notes ?? "—"} theme={theme} />
               <RecordField
                 label="Replacement/Repair"

@@ -25,11 +25,12 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigation } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import { useApi } from "@/hooks/useApi";
+import { ApiError } from "@/lib/api";
 import { useOfflineSync } from "@/hooks/useOfflineSync";
 import { openDirections } from "@/lib/maps";
 import { useGeofenceCheck, Geofence } from "@/hooks/useGeofenceCheck";
 import { prefetchTodaysWork } from "@/lib/prefetch";
-import { SupportServiceRow } from "@/types/support";
+import { SupportServiceRow, SupportServiceStatus } from "@/types/support";
 import { useAppTheme } from "@/theme";
 import { Palette } from "@/theme/palettes";
 import { RootStackParamList } from "@/navigation/RootNavigator";
@@ -123,6 +124,16 @@ interface ScheduleRow {
   // mismatch the way a cross-endpoint join can.
   latitude: number | null;
   longitude: number | null;
+  // NEW — whether this schedule (meaningfully, a printer-less one) has
+  // already been documented as a Support Service. Null on a printer-
+  // bearing schedule (nothing ever links to those) and on a printer-less
+  // one that hasn't been documented yet. `status` mirrors
+  // SupportServiceRow's own two-value outcome — null here specifically
+  // means "documented but not yet marked Achieved/Not Achieved," which
+  // in practice shouldn't happen (the completion route always sets both
+  // together) but is typed to match the real nullable column rather than
+  // asserted non-null.
+  supportServiceCompletion: { id: number; status: SupportServiceStatus | null } | null;
 }
 
 /** "yyyy-MM-dd" in Asia/Manila regardless of the device's own timezone —
@@ -131,6 +142,21 @@ interface ScheduleRow {
  *  timezone the phone happens to be set to. */
 function todayInManila(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Manila" }).format(new Date());
+}
+
+/** Shared with MaintenanceFormScreen/SupportServiceFormScreen/
+ *  PrinterHistoryScreen's identical pattern — surfaces the actual HTTP
+ *  status + URL from a failed query instead of a generic message. Added
+ *  after a report where the real cause (an unimplemented backend route,
+ *  a 404) was invisible behind "Couldn't load..." text, and confirming
+ *  it required reading a Metro console log instead of just looking at
+ *  the screen. Returns null for the offline-uncached case, where the
+ *  detail line isn't useful (there's no HTTP response to describe). */
+function queryErrorDetail(error: unknown, offlineUncached: boolean): string | null {
+  if (offlineUncached) return null;
+  if (error instanceof ApiError) return `HTTP ${error.status} — ${error.url}`;
+  if (error instanceof Error) return error.message;
+  return null;
 }
 
 /** "12:34 AM" in Asia/Manila, for the Shift Complete card's timed-out-at
@@ -210,32 +236,44 @@ export function DashboardScreen() {
   // times in again on a later scheduled day.
   const hasTimedOutToday = !!statusQuery.data?.session && !!statusQuery.data.session.timeOut;
 
+  // True only when attendance status has NEVER been successfully loaded
+  // on this device (no cache to fall back on — see statusQuery.isError's
+  // own comment further down). This is what lets scheduleQuery/
+  // supportQuery fire even though onDuty/hasTimedOutToday can't be
+  // determined: the technician's assigned work for today is still worth
+  // showing read-only, rather than the whole Dashboard going blank over
+  // one failed request. Time In/Out stay unavailable in this state (they
+  // genuinely require a real session to act on), but "what am I assigned
+  // today" doesn't depend on knowing that.
+  const attendanceUnknown = statusQuery.isError;
+
   // Today's itinerary, per-printer — fetched once on duty (for the
   // tappable list) AND after Time Out (for the read-only Shift Complete
   // summary below, which needs the same per-printer Maintained/Missed
   // truth). Before Time In there's nothing to tap into yet; the
   // pre-Time-In view only needs the single firstStop from
-  // attendance-status above.
+  // attendance-status above. ALSO fetched when attendanceUnknown — see
+  // that flag's own comment.
   const technicianId = userStatusQuery.data?.id;
   const scheduleQuery = useQuery({
     queryKey: ["schedule", technicianId, "today"],
     queryFn: () =>
       api.get<ScheduleRow[]>(`/api/schedule?technicianId=${technicianId}&scheduledAt=${todayInManila()}`),
-    enabled: (onDuty || hasTimedOutToday) && technicianId != null,
+    enabled: (onDuty || hasTimedOutToday || attendanceUnknown) && technicianId != null,
   });
 
   // Today's support services — the non-maintenance half of the
   // technician's assigned work (BIR forms, collection, billing,
-  // contracts). Fetched under the same on-duty/timed-out gate as the
-  // printer itinerary, and keyed the same way, so both halves of "today"
-  // refresh together.
+  // contracts). Fetched under the same on-duty/timed-out/unknown gate as
+  // the printer itinerary, and keyed the same way, so both halves of
+  // "today" refresh together.
   const supportQuery = useQuery({
     queryKey: ["support-services", technicianId, "today"],
     queryFn: () =>
       api.get<SupportServiceRow[]>(
         `/api/support-services?technicianId=${technicianId}&scheduledAt=${todayInManila()}`
       ),
-    enabled: (onDuty || hasTimedOutToday) && technicianId != null,
+    enabled: (onDuty || hasTimedOutToday || attendanceUnknown) && technicianId != null,
   });
 
   // Warms the cache for every printer/support-service FORM today's
@@ -323,6 +361,26 @@ export function DashboardScreen() {
     return ids;
   }, [offlineSync.reports]);
 
+  // Same purpose as locallyQueuedSupportIds above, but keyed by
+  // `scheduleId` instead of `supportServiceId` — a printer-less schedule
+  // documented offline hasn't been assigned a supportServices.id yet (the
+  // backend creates that row on sync), so scheduleId is the only stable
+  // identifier available to check "is this already queued" against
+  // before a sync round trip happens.
+  const locallyQueuedScheduleIds = React.useMemo(() => {
+    const ids = new Set<number>();
+    for (const r of offlineSync.reports) {
+      if (r.kind !== "support") continue;
+      try {
+        const id = JSON.parse(r.payload)?.scheduleId;
+        if (typeof id === "number") ids.add(id);
+      } catch {
+        // Same reasoning as locallyQueuedSupportIds above.
+      }
+    }
+    return ids;
+  }, [offlineSync.reports]);
+
   const openSupportService = (row: SupportServiceRow) => {
     if (row.status) {
       Alert.alert("Already recorded", `This activity was already filed as "${row.status}".`);
@@ -336,6 +394,37 @@ export function DashboardScreen() {
       return;
     }
     navigation.navigate("SupportServiceForm", { supportServiceId: row.id });
+  };
+
+  // Opens the SAME form, sourced from a printer-less `schedules` row
+  // instead of an existing `supportServices` row — see
+  // SupportServiceFormScreen's own handling of the `scheduleId` param
+  // shape. Passes client/location/notes straight through from the
+  // already-loaded schedule rather than making the form re-fetch data
+  // this screen already has in hand.
+  const openSupportServiceFromSchedule = (schedule: ScheduleRow) => {
+    if (schedule.supportServiceCompletion) {
+      Alert.alert(
+        "Already recorded",
+        `This activity was already filed as "${schedule.supportServiceCompletion.status ?? "documented"}".`
+      );
+      return;
+    }
+    if (locallyQueuedScheduleIds.has(schedule.id)) {
+      Alert.alert(
+        "Already queued",
+        "This activity is already saved and waiting to sync — check the Maintenance tab's Synchronization panel for its status."
+      );
+      return;
+    }
+    navigation.navigate("SupportServiceForm", {
+      scheduleId: schedule.id,
+      clientId: schedule.clientId,
+      locationId: schedule.locationId,
+      client: schedule.client.name,
+      location: schedule.location.name,
+      notes: schedule.notes,
+    });
   };
 
   /** The Support Services half of the itinerary. Rendered as the printer
@@ -352,11 +441,18 @@ export function DashboardScreen() {
         {supportQuery.isLoading ? (
           <ActivityIndicator color={theme.primary} />
         ) : supportQuery.isError ? (
-          <Text style={styles.error}>
-            {offlineSync.online
-              ? "Couldn't load today's support services."
-              : "You're offline and support services haven't been downloaded to this device yet."}
-          </Text>
+          <View>
+            <Text style={styles.error}>
+              {offlineSync.online
+                ? "Couldn't load today's support services."
+                : "You're offline and support services haven't been downloaded to this device yet."}
+            </Text>
+            {queryErrorDetail(supportQuery.error, !offlineSync.online) && (
+              <Text style={styles.errorDetail}>
+                {queryErrorDetail(supportQuery.error, !offlineSync.online)}
+              </Text>
+            )}
+          </View>
         ) : totalCount === 0 ? (
           <Text style={styles.subtitle}>No support services scheduled today.</Text>
         ) : (
@@ -422,38 +518,74 @@ export function DashboardScreen() {
             {/* Reclassified schedules — real `schedules` rows with no
                 printer attached, automatically routed here instead of
                 Technical Services (see printerSchedules/noPrinterSchedules
-                above). Deliberately NOT pressable/no chevron: there is no
-                existing completion action for a printer-less schedule
-                (no supportServiceTypeId, no status column, no
-                photo/signature contract the way a real `supportServices`
-                row has) — this card is informational plus navigation
-                only, not a stand-in for the real thing. If technicians
-                need to formally complete these the same way, that's a
-                product/backend decision — see this delta's notes. */}
-            {noPrinterSchedules.map((schedule) => (
-              <View key={`sched-${schedule.id}`} style={styles.supportCard}>
-                <View style={styles.supportIconWrap}>
-                  <Feather name="map-pin" size={16} color={theme.mutedForeground} />
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.stopClient}>{schedule.client.name}</Text>
-                  <Text style={styles.stopLocation}>{schedule.location.name}</Text>
-                  <View style={styles.supportTypeRow}>
-                    <Text style={[styles.supportTypeTag, styles.noPrinterTag]}>
-                      No printer assigned
-                    </Text>
+                above). Now fully functional: tapping one opens the same
+                Support Services form a Scheduler-created row uses (photo,
+                signature, signatory, type selection), sourced from this
+                schedule's own client/location/notes instead of a
+                supportServices row that doesn't exist until the
+                technician documents it — see
+                openSupportServiceFromSchedule and
+                SupportServiceFormScreen's `scheduleId` param handling. */}
+            {noPrinterSchedules.map((schedule) => {
+              const isQueued = locallyQueuedScheduleIds.has(schedule.id);
+              const completion = schedule.supportServiceCompletion;
+              const effectiveStatus = completion?.status ?? (isQueued ? "Pending Sync" : null);
+              const statusColor =
+                effectiveStatus === "Achieved"
+                  ? theme.success
+                  : effectiveStatus === "Not Achieved"
+                  ? theme.destructive
+                  : effectiveStatus === "Pending Sync"
+                  ? theme.warning
+                  : theme.mutedForeground;
+              const locked = completion != null || isQueued;
+              return (
+                <Pressable
+                  key={`sched-${schedule.id}`}
+                  style={[styles.supportCard, locked && styles.printerRowDone]}
+                  onPress={readOnly ? undefined : () => openSupportServiceFromSchedule(schedule)}
+                  disabled={readOnly}
+                >
+                  <View style={styles.supportIconWrap}>
+                    <Feather name="clipboard" size={16} color={theme.info} />
                   </View>
-                  {schedule.notes ? <Text style={styles.notes}>{schedule.notes}</Text> : null}
-                </View>
-                {!readOnly && (
-                  <NavButton
-                    navKey={`sched-${schedule.id}`}
-                    latitude={schedule.latitude}
-                    longitude={schedule.longitude}
-                  />
-                )}
-              </View>
-            ))}
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.stopClient}>{schedule.client.name}</Text>
+                    <Text style={styles.stopLocation}>{schedule.location.name}</Text>
+                    <View style={styles.supportTypeRow}>
+                      <Text style={[styles.supportTypeTag, styles.noPrinterTag]}>
+                        No printer assigned
+                      </Text>
+                    </View>
+                    {schedule.notes ? <Text style={styles.notes}>{schedule.notes}</Text> : null}
+                  </View>
+                  <View style={{ alignItems: "flex-end", gap: 6 }}>
+                    {effectiveStatus ? (
+                      <View style={[styles.statusBadge, { backgroundColor: `${statusColor}26` }]}>
+                        <Text style={[styles.statusBadgeText, { color: statusColor }]}>
+                          {effectiveStatus}
+                        </Text>
+                      </View>
+                    ) : readOnly ? (
+                      <View style={[styles.statusBadge, { backgroundColor: `${theme.destructive}26` }]}>
+                        <Text style={[styles.statusBadgeText, { color: theme.destructive }]}>
+                          Missed
+                        </Text>
+                      </View>
+                    ) : (
+                      <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
+                    )}
+                    {!readOnly && (
+                      <NavButton
+                        navKey={`sched-${schedule.id}`}
+                        latitude={schedule.latitude}
+                        longitude={schedule.longitude}
+                      />
+                    )}
+                  </View>
+                </Pressable>
+              );
+            })}
           </View>
         )}
       </View>
@@ -544,30 +676,58 @@ export function DashboardScreen() {
   // exactly the false "No location is on file" block a technician can
   // hit while standing right on a real, correctly-configured pin.
   //
-  // Fallback: derive it from `itinerary`, which — unlike lastGeofence —
-  // IS pre-existing, real, already-working data (it's what powers the
-  // pre-Time-In preview's own navigate icons, confirmed present before
-  // any of this session's changes). Sorted by `sequence` defensively
-  // (nulls last) rather than trusting raw array order, then take the
-  // actual last entry — not the last entry that HAS a pin, since
-  // falling back to an earlier stop's coordinates would validate Time
-  // Out against the wrong location, which is worse than correctly
-  // reporting "the real last stop has no pin."
+  // Fallback, tier 1: derive it from `itinerary`, which — unlike
+  // lastGeofence — IS pre-existing, real, already-working data (it's
+  // what powers the pre-Time-In preview's own navigate icons, confirmed
+  // present before any of this session's changes). Sorted by `sequence`
+  // defensively (nulls last), then take the actual last entry — not the
+  // last entry that HAS a pin, since falling back to an earlier stop's
+  // coordinates would validate Time Out against the wrong location,
+  // which is worse than correctly reporting "the real last stop has no
+  // pin."
   //
-  // radiusMeters isn't part of an itinerary stop, so this reuses the
+  // Fallback, tier 2: if `itinerary` is EMPTY (a day with no printer
+  // stops at all — e.g. entirely Support Services), fall back further
+  // to the last row in `supportQuery.data`. This is the case a
+  // technician whose whole day is Support Services would otherwise hit
+  // unconditionally: tier 1 alone always resolves to null on an
+  // all-support day, since there's nothing in `itinerary` to derive
+  // from at all — not a missing-pin problem, an empty-source problem.
+  //
+  // Deliberately NOT attempted when BOTH sources have entries: without
+  // a shared ordering field across `schedules` and `supportServices`
+  // (see BACKEND-SPEC-delta-003.md's "worth deciding" section — this is
+  // the same unresolved gap), there's no reliable way to know whether
+  // the true last stop was a printer visit or a support errand. This
+  // tier only fires for the unambiguous case (one source is completely
+  // empty), which is intentionally conservative: guessing wrong here
+  // would let Time Out silently validate against the wrong location,
+  // which is a worse failure than correctly refusing to guess.
+  //
+  // radiusMeters isn't part of either source row, so this reuses the
   // Time-In geofence's own radius as a stand-in (same on-site policy
   // presumably applies to every stop) rather than inventing an
   // arbitrary constant.
   const derivedLastStop = React.useMemo(() => {
     const itinerary = statusQuery.data?.itinerary ?? [];
-    if (itinerary.length === 0) return null;
-    const sorted = [...itinerary].sort((a, b) => {
-      if (a.sequence == null) return 1;
-      if (b.sequence == null) return -1;
-      return a.sequence - b.sequence;
-    });
-    return sorted[sorted.length - 1];
-  }, [statusQuery.data?.itinerary]);
+    if (itinerary.length > 0) {
+      const sorted = [...itinerary].sort((a, b) => {
+        if (a.sequence == null) return 1;
+        if (b.sequence == null) return -1;
+        return a.sequence - b.sequence;
+      });
+      return sorted[sorted.length - 1];
+    }
+    const supportRows = supportQuery.data ?? [];
+    if (supportRows.length > 0) {
+      const lastSupport = supportRows[supportRows.length - 1];
+      return {
+        latitude: lastSupport.latitude,
+        longitude: lastSupport.longitude,
+      };
+    }
+    return null;
+  }, [statusQuery.data?.itinerary, supportQuery.data]);
 
   const lastGeofence: Geofence | null =
     statusQuery.data?.lastGeofence ??
@@ -699,18 +859,75 @@ export function DashboardScreen() {
     // "success", not "error") across restarts and offline periods. What
     // this actually catches now is closer to "never had a successful
     // load on this device at all," which genuinely does need connectivity
-    // once — there's nothing to fall back to.
+    // once for THIS specific data.
+    //
+    // It must NOT take the rest of the Dashboard down with it, though —
+    // scheduleQuery/supportQuery are independent requests (now enabled
+    // via attendanceUnknown above) and are shown here read-only whenever
+    // they have anything to show, rather than the technician losing all
+    // visibility into today's assigned work over one failed request. Time
+    // In/Out stay unavailable — those genuinely need a real session to
+    // act on — but "what am I assigned today" doesn't.
+    const hasDegradedContent =
+      (scheduleQuery.data && scheduleQuery.data.length > 0) ||
+      (supportQuery.data && supportQuery.data.length > 0);
     return (
-      <View style={styles.centered}>
-        <Text style={styles.error}>
-          {offlineSync.online
-            ? "Couldn't reach the server. Check your connection."
-            : "You're offline, and this device hasn't loaded your schedule before. Connect once to get started — after that it stays available offline."}
-        </Text>
-        <Pressable style={styles.secondaryButton} onPress={() => statusQuery.refetch()}>
-          <Text style={styles.secondaryButtonText}>Retry</Text>
-        </Pressable>
-      </View>
+      <ScrollView
+        style={{ flex: 1, backgroundColor: theme.background }}
+        contentContainerStyle={{ padding: 16, gap: 16 }}
+      >
+        <View style={styles.centeredInline}>
+          <Text style={styles.error}>
+            {offlineSync.online
+              ? "Couldn't reach the server. Check your connection."
+              : "You're offline, and this device hasn't loaded your schedule before. Connect once to get started — after that it stays available offline."}
+          </Text>
+          {queryErrorDetail(statusQuery.error, !offlineSync.online) && (
+            <Text style={styles.errorDetail}>{queryErrorDetail(statusQuery.error, !offlineSync.online)}</Text>
+          )}
+          <Text style={styles.subtitle}>Time In and Time Out aren't available until this is restored.</Text>
+          <Pressable style={styles.secondaryButton} onPress={() => statusQuery.refetch()}>
+            <Text style={styles.secondaryButtonText}>Retry</Text>
+          </Pressable>
+        </View>
+
+        {hasDegradedContent && (
+          <View>
+            <Text style={styles.sectionTitle}>Today's Assigned Work (Limited View)</Text>
+            <Text style={styles.subtitle}>
+              Read-only until your attendance status is restored.
+            </Text>
+            {(scheduleQuery.data ?? []).map((schedule) => (
+              <View key={`degraded-sched-${schedule.id}`} style={[styles.supportCard, { marginTop: 10 }]}>
+                <View style={styles.supportIconWrap}>
+                  <Feather name="printer" size={16} color={theme.info} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.stopClient}>{schedule.client.name}</Text>
+                  <Text style={styles.stopLocation}>{schedule.location.name}</Text>
+                  <Text style={styles.notes}>
+                    {schedule.scheduleDetails.length} printer{schedule.scheduleDetails.length === 1 ? "" : "s"}
+                  </Text>
+                </View>
+              </View>
+            ))}
+            {(supportQuery.data ?? []).map((row) => (
+              <View key={`degraded-support-${row.id}`} style={[styles.supportCard, { marginTop: 10 }]}>
+                <View style={styles.supportIconWrap}>
+                  <Feather name="clipboard" size={16} color={theme.info} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.stopClient}>{row.client}</Text>
+                  <Text style={styles.stopLocation}>{row.location}</Text>
+                  <View style={styles.supportTypeRow}>
+                    <Text style={styles.supportTypeTag}>{row.supportServiceType}</Text>
+                  </View>
+                </View>
+              </View>
+            ))}
+          </View>
+        )}
+      </ScrollView>
     );
   }
 
@@ -827,11 +1044,18 @@ export function DashboardScreen() {
         {scheduleQuery.isLoading ? (
           <ActivityIndicator color={theme.primary} />
         ) : scheduleQuery.isError ? (
-          <Text style={styles.error}>
-            {offlineSync.online
-              ? "Couldn't load today's summary."
-              : "You're offline and today's summary hasn't been downloaded to this device yet."}
-          </Text>
+          <View>
+            <Text style={styles.error}>
+              {offlineSync.online
+                ? "Couldn't load today's summary."
+                : "You're offline and today's summary hasn't been downloaded to this device yet."}
+            </Text>
+            {queryErrorDetail(scheduleQuery.error, !offlineSync.online) && (
+              <Text style={styles.errorDetail}>
+                {queryErrorDetail(scheduleQuery.error, !offlineSync.online)}
+              </Text>
+            )}
+          </View>
         ) : allDetails.length === 0 ? (
           <Text style={styles.subtitle}>No printer maintenance was scheduled today.</Text>
         ) : (
@@ -1046,11 +1270,18 @@ export function DashboardScreen() {
       {scheduleQuery.isLoading ? (
         <ActivityIndicator color={theme.primary} />
       ) : scheduleQuery.isError ? (
-        <Text style={styles.error}>
-          {offlineSync.online
-            ? "Couldn't load today's printers."
-            : "You're offline and today's printers haven't been downloaded to this device yet."}
-        </Text>
+        <View>
+          <Text style={styles.error}>
+            {offlineSync.online
+              ? "Couldn't load today's printers."
+              : "You're offline and today's printers haven't been downloaded to this device yet."}
+          </Text>
+          {queryErrorDetail(scheduleQuery.error, !offlineSync.online) && (
+            <Text style={styles.errorDetail}>
+              {queryErrorDetail(scheduleQuery.error, !offlineSync.online)}
+            </Text>
+          )}
+        </View>
       ) : (
         <FlatList
           data={printerSchedules}
@@ -1248,9 +1479,25 @@ function createStyles(theme: Palette) {
       gap: 12,
       backgroundColor: theme.background,
     },
+    // Same look as `centered`, but without flex:1 — used inside a
+    // ScrollView (the statusQuery.isError degraded view) where the error
+    // banner is one block among others, not the only thing on screen.
+    centeredInline: {
+      alignItems: "center",
+      gap: 12,
+      paddingVertical: 16,
+    },
     title: { fontSize: 20, fontWeight: "700", color: theme.foreground },
     subtitle: { color: theme.mutedForeground, textAlign: "center" },
     error: { color: theme.destructive, textAlign: "center" },
+    errorDetail: {
+      textAlign: "center",
+      color: theme.mutedForeground,
+      fontFamily: "monospace",
+      fontSize: 11,
+      marginTop: 4,
+      opacity: 0.7,
+    },
 
     timeInCard: {
       backgroundColor: theme.card,

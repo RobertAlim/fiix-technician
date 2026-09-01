@@ -35,3 +35,16 @@ export const GPS_PING_INTERVAL_MS = 10_000;
 export const GPS_DISTANCE_FILTER_METERS = 15;
 
 export const BACKGROUND_LOCATION_TASK = "fiix-background-location-task";
+
+// How often a still-running foreground session re-checks the required
+// build (see src/lib/version-check.ts / RootNavigator.tsx). The request
+// says "on app startup," but a technician can plausibly leave the app
+// open for hours after a new required build is published — without a
+// periodic re-check, "outdated builds cannot continue operating" would
+// only be true at the NEXT cold start, not while a session is already
+// running. Combined with focusManager (App.tsx, from the offline-
+// capability work) refetching on every foreground too, this means a
+// build gets caught either on a ~30-minute timer or the next time the
+// technician switches back into the app, whichever comes first.
+export const VERSION_CHECK_INTERVAL_MS = 30 * 60 * 1000;
+

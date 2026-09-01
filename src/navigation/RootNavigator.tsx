@@ -11,7 +11,7 @@ import React from "react";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { useAuth } from "@clerk/expo";
 import { useQuery } from "@tanstack/react-query";
-import { ActivityIndicator, View } from "react-native";
+import { ActivityIndicator, View, Text, Pressable } from "react-native";
 
 import { useApi } from "@/hooks/useApi";
 import { ApiError } from "@/lib/api";
@@ -20,12 +20,21 @@ import { SignInScreen } from "@/screens/SignInScreen";
 import { RegistrationScreen } from "@/screens/RegistrationScreen";
 import { AccountPendingScreen } from "@/screens/AccountPendingScreen";
 import { UnsupportedRoleScreen } from "@/screens/UnsupportedRoleScreen";
+import { UpdateRequiredScreen } from "@/screens/UpdateRequiredScreen";
 import { AppTabs } from "@/navigation/AppTabs";
 import { MaintenanceFormScreen } from "@/screens/MaintenanceFormScreen";
 import { ScanQRScreen } from "@/screens/ScanQRScreen";
 import { CropImageScreen } from "@/screens/CropImageScreen";
 import { SupportServiceFormScreen } from "@/screens/SupportServiceFormScreen";
 import { PrinterHistoryScreen } from "@/screens/PrinterHistoryScreen";
+import { VERSION_CHECK_INTERVAL_MS } from "@/config";
+import {
+  VersionCheckResponse,
+  getInstalledBuildNumber,
+  getRequiredBuildNumber,
+  getUpdateUrl,
+  isBuildOutdated,
+} from "@/lib/version-check";
 
 export type RootStackParamList = {
   AppTabs: undefined;
@@ -45,12 +54,27 @@ export type RootStackParamList = {
   // ScanQR/scan-bridge.ts), not a param, since there's no built-in way
   // for a popped screen to hand a value back up the stack.
   CropImage: { uri: string };
-  // Support Services: only the row id is passed, for the same reason
-  // MaintenanceForm takes only a serialNo — the screen re-resolves the
-  // full activity (and its signatories) itself from one endpoint, so it
-  // behaves identically however it was reached and never renders stale
-  // params handed down from a list that may have refetched since.
-  SupportServiceForm: { supportServiceId: number };
+  // Support Services now opens in two ways:
+  //  - { supportServiceId }: a Scheduler-created row — the screen
+  //    re-resolves the full activity (and its signatories) from one
+  //    endpoint, same reasoning as MaintenanceForm taking only a
+  //    serialNo, so it behaves identically however it was reached.
+  //  - { scheduleId, ...fromSchedule }: documenting a printer-less
+  //    `schedules` row for the first time. No supportServices row exists
+  //    yet to fetch, so the client/location/notes the Dashboard already
+  //    has loaded are passed through directly instead of adding a round
+  //    trip to re-fetch data the caller already had in hand — signatories
+  //    are fetched separately via the existing GET /api/signatories.
+  SupportServiceForm:
+    | { supportServiceId: number }
+    | {
+        scheduleId: number;
+        clientId: number;
+        locationId: number;
+        client: string;
+        location: string;
+        notes: string | null;
+      };
   // Read-only history view for one printer. serialNo, not printerId:
   // it's the identifier every other lookup in this app is keyed by
   // (GET /api/maintain?serialNo=, the QR codes themselves), so a caller
@@ -87,11 +111,100 @@ export function RootNavigator() {
   const api = useApi();
   const { theme } = useAppTheme();
 
+  // Mandatory version gate — checked FIRST, before isLoaded/isSignedIn,
+  // so an outdated build is blocked before it can even reach the sign-in
+  // screen. Deliberately unauthenticated (see version-check.ts) for
+  // exactly that reason: it can't depend on a Clerk token the technician
+  // doesn't have yet.
+  //
+  // `enabled: true` unconditionally (no gate on isSignedIn) is the
+  // whole point here — every other query in this file only runs once
+  // signed in; this one has to run regardless.
+  const versionQuery = useQuery({
+    queryKey: ["app-version-check"],
+    queryFn: () => api.get<VersionCheckResponse>("/api/app-version"),
+    // Re-checks a still-running session periodically, not just at cold
+    // start — see VERSION_CHECK_INTERVAL_MS's own comment for why "on
+    // app startup" alone isn't enough for a HARD enforcement claim.
+    // refetchOnWindowFocus (react-query's default, wired to AppState via
+    // focusManager in App.tsx) adds a second trigger on top of this
+    // timer: switching back into the app after using something else
+    // re-checks immediately rather than waiting out the rest of the
+    // interval.
+    refetchInterval: VERSION_CHECK_INTERVAL_MS,
+  });
+
+  // Declared here, BEFORE any conditional return below — React's hook
+  // rules require every hook to run unconditionally on every render, in
+  // the same order. This has to stay above the version-gate's early
+  // returns for that reason, even though its result is only consumed
+  // further down; splitting it out to sit next to its "not signed in"
+  // check would put a `useQuery` call after an early `return`.
   const statusQuery = useQuery({
     queryKey: ["user-status"],
     queryFn: () => api.get<UserStatus>("/api/user-status"),
     enabled: isSignedIn === true,
   });
+
+  if (versionQuery.data) {
+    const installedBuild = getInstalledBuildNumber();
+    const requiredBuild = getRequiredBuildNumber(versionQuery.data);
+    if (isBuildOutdated(installedBuild, requiredBuild)) {
+      return (
+        <UpdateRequiredScreen
+          updateUrl={getUpdateUrl(versionQuery.data)}
+          message={versionQuery.data.message}
+        />
+      );
+    }
+    // Installed build is current — fall through to the rest of the app
+    // normally. A background refetch failing LATER (e.g. the technician
+    // goes offline mid-shift) does not re-trigger this branch, because
+    // `versionQuery.data` still holds the last successful response —
+    // exactly the "don't lock out an already-verified offline session"
+    // behavior the delta README explains in more depth.
+  } else if (versionQuery.isError) {
+    // No cached data AND the live check just failed — this device has
+    // NEVER successfully verified its build. Fails closed here,
+    // deliberately: unlike every other query in this app, letting an
+    // unverified build through "just this once" is precisely the gap a
+    // mandatory version gate exists to close. In practice this is a
+    // narrow window (effectively "first-ever launch with no
+    // connectivity"), since Clerk sign-in itself needs a network
+    // connection the technician doesn't have here either.
+    return (
+      <Centered>
+        <View style={{ padding: 24, gap: 16, alignItems: "center" }}>
+          <Text style={{ color: theme.foreground, fontWeight: "700", fontSize: 16, textAlign: "center" }}>
+            Couldn't verify app version
+          </Text>
+          <Text style={{ color: theme.mutedForeground, textAlign: "center" }}>
+            This device hasn't verified it's running an approved build yet. Connect to the
+            internet and try again.
+          </Text>
+          <Pressable
+            style={{
+              borderWidth: 1,
+              borderColor: theme.border,
+              borderRadius: theme.radius,
+              paddingVertical: 10,
+              paddingHorizontal: 24,
+            }}
+            onPress={() => versionQuery.refetch()}
+          >
+            <Text style={{ color: theme.foreground, fontWeight: "600" }}>Retry</Text>
+          </Pressable>
+        </View>
+      </Centered>
+    );
+  } else if (versionQuery.isLoading) {
+    // First-ever check, still in flight, nothing cached yet.
+    return (
+      <Centered>
+        <ActivityIndicator size="large" color={theme.primary} />
+      </Centered>
+    );
+  }
 
   if (!isLoaded) {
     return (

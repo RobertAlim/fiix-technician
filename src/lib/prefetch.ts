@@ -26,6 +26,8 @@ interface PrefetchScheduleDetail {
   printer: { serialNo: string };
 }
 interface PrefetchSchedule {
+  clientId: number;
+  locationId: number;
   scheduleDetails: PrefetchScheduleDetail[];
 }
 interface PrefetchSupportService {
@@ -105,6 +107,28 @@ export async function prefetchTodaysWork(
       queryClient.prefetchQuery({
         queryKey: ["support-service", row.id],
         queryFn: () => api.get(`/api/support-services/${row.id}`),
+      })
+    );
+  }
+
+  // Printer-less schedules — the "documented as a Support Service"
+  // workflow SupportServiceFormScreen's scheduleId branch uses. There's
+  // no per-schedule detail endpoint to warm (client/location/notes are
+  // already on the schedule row DashboardScreen passes as nav params),
+  // but signatories ARE a live fetch that screen makes
+  // (GET /api/signatories?clientId=&locationId=) — same queryKey shape
+  // it uses, so this warms the exact cache entry the form will read.
+  const noPrinterClientLocationPairs = new Set<string>();
+  for (const schedule of schedules) {
+    if (schedule.scheduleDetails.length > 0) continue;
+    noPrinterClientLocationPairs.add(`${schedule.clientId}:${schedule.locationId}`);
+  }
+  for (const pair of noPrinterClientLocationPairs) {
+    const [clientId, locationId] = pair.split(":");
+    tasks.push(
+      queryClient.prefetchQuery({
+        queryKey: ["signatories", Number(clientId), Number(locationId)],
+        queryFn: () => api.get(`/api/signatories?clientId=${clientId}&locationId=${locationId}`),
       })
     );
   }

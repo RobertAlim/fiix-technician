@@ -107,10 +107,53 @@ export function SupportServiceFormScreen() {
     }, [])
   );
 
+  // Discriminates the two ways this screen can be opened, narrowing ONCE
+  // here into plain local constants rather than repeatedly trying to
+  // re-narrow the `params` union via a boolean flag at each use site
+  // below — `const isFromSchedule = "scheduleId" in params` followed by
+  // `isFromSchedule ? params.x : params.y` does NOT actually narrow
+  // `params` in TypeScript (the narrowing only applies within the `in`
+  // check's own conditional expression, not to a boolean derived from it
+  // and reused later), which would fail real compilation even though it
+  // can look correct at a glance.
+  let scheduleParams: {
+    scheduleId: number;
+    clientId: number;
+    locationId: number;
+    client: string;
+    location: string;
+    notes: string | null;
+  } | null = null;
+  let supportServiceIdParam: number | null = null;
+  if ("scheduleId" in params) {
+    scheduleParams = params;
+  } else {
+    supportServiceIdParam = params.supportServiceId;
+  }
+  const isFromSchedule = scheduleParams != null;
+
   const detailQuery = useQuery({
-    queryKey: ["support-service", params.supportServiceId],
+    queryKey: ["support-service", supportServiceIdParam],
+    queryFn: () => api.get<SupportServiceDetailResponse>(`/api/support-services/${supportServiceIdParam}`),
+    // No supportServices row exists yet for the schedule-sourced case —
+    // there's nothing to fetch (client/location/notes came through
+    // directly as params, see RootStackParamList's own comment on this
+    // route), so this query never runs for it.
+    enabled: supportServiceIdParam != null,
+  });
+  // Signatories for the schedule-sourced case — the existing-row case
+  // still gets them bundled in detailQuery's response above (same
+  // reasoning as GET /api/maintain bundling them with printer info); this
+  // is the SAME underlying GET /api/signatories route SignatoryPicker's
+  // own "add new" POST already targets, just called directly here since
+  // there's no supportServices row to bundle them onto yet.
+  const signatoriesQuery = useQuery({
+    queryKey: ["signatories", scheduleParams?.clientId ?? null, scheduleParams?.locationId ?? null],
     queryFn: () =>
-      api.get<SupportServiceDetailResponse>(`/api/support-services/${params.supportServiceId}`),
+      api.get<SignatoryOption[]>(
+        `/api/signatories?clientId=${scheduleParams!.clientId}&locationId=${scheduleParams!.locationId}`
+      ),
+    enabled: scheduleParams != null,
   });
   const userStatusQuery = useQuery({
     queryKey: ["user-status"],
@@ -128,13 +171,29 @@ export function SupportServiceFormScreen() {
   const [signatureUri, setSignatureUri] = useState<string | null>(null);
   const [signatureDrawing, setSignatureDrawing] = useState(false);
   const [saving, setSaving] = useState(false);
-  // The service type is pre-set by whoever scheduled the activity, but is
-  // editable here: a technician who arrives and finds the actual errand
-  // was something else shouldn't have to file it under the wrong type.
-  // Initialised from the scheduled value once the detail query lands.
+  // The service type is pre-set by whoever scheduled the activity for the
+  // existing-row case, but is editable here: a technician who arrives and
+  // finds the actual errand was something else shouldn't have to file it
+  // under the wrong type. For the schedule-sourced case there IS no
+  // pre-assigned type (a printer-less schedule only ever carried a free-
+  // text note, never a type selection) — this stays unset until the
+  // technician picks one, which validate() already requires below.
   const [typeId, setTypeId] = useState<string | null>(null);
 
-  const activity = detailQuery.data?.supportService;
+  const activity = scheduleParams ? null : detailQuery.data?.supportService;
+
+  // Normalized display fields — usable regardless of which of the two
+  // sources this screen was opened from, so the render below (and save())
+  // doesn't need to branch on isFromSchedule at every use site.
+  const clientName = scheduleParams?.client ?? activity?.client;
+  const locationName = scheduleParams?.location ?? activity?.location;
+  const clientId = scheduleParams?.clientId ?? activity?.clientId;
+  const locationId = scheduleParams?.locationId ?? activity?.locationId;
+  const schedulerNotes = scheduleParams?.notes ?? activity?.notes;
+  const existingTypeLabel = scheduleParams ? null : activity?.supportServiceType;
+  const signatories: SignatoryOption[] = scheduleParams
+    ? signatoriesQuery.data ?? []
+    : detailQuery.data?.signatories ?? [];
 
   React.useEffect(() => {
     if (activity && typeId == null) {
@@ -179,7 +238,7 @@ export function SupportServiceFormScreen() {
   };
 
   const save = async () => {
-    if (!activity) {
+    if (clientId == null || locationId == null) {
       Alert.alert("Activity details are still loading — try again in a moment.");
       return;
     }
@@ -203,10 +262,16 @@ export function SupportServiceFormScreen() {
 
       const id = uuidv4();
       const payload = {
-        supportServiceId: activity.id,
+        // Exactly one of these two, matching the backend's exactly-one-of
+        // validation — see types/support.ts's own comment on why.
+        // `scheduleParams`/`activity` are the properly-narrowed locals
+        // from the top of this component; `params.scheduleId` directly
+        // here would hit the exact same union-narrowing problem this
+        // component's opening comment explains.
+        ...(scheduleParams ? { scheduleId: scheduleParams.scheduleId } : { supportServiceId: activity!.id }),
         supportServiceTypeId: Number(typeId),
-        clientId: activity.clientId,
-        locationId: activity.locationId,
+        clientId,
+        locationId,
         technicianId: userStatusQuery.data.id,
         signatoryId: Number(signatoryId),
         status,
@@ -262,27 +327,31 @@ export function SupportServiceFormScreen() {
     }
   };
 
-  if (detailQuery.isLoading) {
+  const isLoading = isFromSchedule ? signatoriesQuery.isLoading : detailQuery.isLoading;
+  const hasError = isFromSchedule ? signatoriesQuery.isError : detailQuery.isError || !activity;
+
+  if (isLoading) {
     return (
       <View style={styles.centered}>
         <ActivityIndicator size="large" color={theme.primary} />
       </View>
     );
   }
-  if (detailQuery.isError || !activity) {
+  if (hasError) {
     // Same distinction as MaintenanceFormScreen's printer-lookup error —
     // DashboardScreen's prefetch (lib/prefetch.ts) warms every support
     // service on today's list, so reaching this uncached-and-offline
     // path means this activity wasn't part of what was prefetched
     // (e.g. added to the schedule after the technician last had signal).
-    const offlineUncached = !isOnline && !activity;
-    const err = detailQuery.error;
+    const offlineUncached = !isOnline && (isFromSchedule ? !signatoriesQuery.data : !activity);
+    const err = isFromSchedule ? signatoriesQuery.error : detailQuery.error;
     const detail =
       !offlineUncached && err instanceof ApiError
         ? `HTTP ${err.status} — ${err.url}`
         : !offlineUncached && err instanceof Error
         ? err.message
         : null;
+    const retry = () => (isFromSchedule ? signatoriesQuery.refetch() : detailQuery.refetch());
     return (
       <View style={styles.centered}>
         <Text style={styles.error}>
@@ -296,7 +365,7 @@ export function SupportServiceFormScreen() {
             Connect to the internet once to load it — after that it stays available offline.
           </Text>
         ) : (
-          <Pressable style={styles.secondaryButton} onPress={() => detailQuery.refetch()}>
+          <Pressable style={styles.secondaryButton} onPress={retry}>
             <Text style={styles.secondaryButtonText}>Retry</Text>
           </Pressable>
         )}
@@ -311,17 +380,19 @@ export function SupportServiceFormScreen() {
       scrollEnabled={!signatureDrawing}
     >
       <View style={styles.infoCard}>
-        <Text style={styles.infoClient}>{activity.client}</Text>
-        <Text style={styles.infoLine}>{activity.location}</Text>
-        <View style={styles.infoRow}>
-          <Text style={styles.infoTag}>{activity.supportServiceType}</Text>
-        </View>
-        {activity.notes ? (
+        <Text style={styles.infoClient}>{clientName}</Text>
+        <Text style={styles.infoLine}>{locationName}</Text>
+        {existingTypeLabel ? (
+          <View style={styles.infoRow}>
+            <Text style={styles.infoTag}>{existingTypeLabel}</Text>
+          </View>
+        ) : null}
+        {schedulerNotes ? (
           <View style={styles.schedulerNotes}>
             <Feather name="message-square" size={13} color={theme.info} style={{ marginTop: 1 }} />
             <View style={{ flex: 1 }}>
               <Text style={styles.schedulerNotesLabel}>Notes from Scheduler</Text>
-              <Text style={styles.schedulerNotesText}>{activity.notes}</Text>
+              <Text style={styles.schedulerNotesText}>{schedulerNotes}</Text>
             </View>
           </View>
         ) : null}
@@ -381,14 +452,14 @@ export function SupportServiceFormScreen() {
 
       <SignatoryPicker
         api={api}
-        signatories={detailQuery.data?.signatories ?? []}
+        signatories={signatories}
         value={signatoryId}
         onChange={setSignatoryId}
-        clientId={activity.clientId}
-        locationId={activity.locationId}
-        clientName={activity.client}
-        locationName={activity.location}
-        onAdded={() => detailQuery.refetch()}
+        clientId={clientId!}
+        locationId={locationId!}
+        clientName={clientName ?? ""}
+        locationName={locationName ?? ""}
+        onAdded={() => (isFromSchedule ? signatoriesQuery.refetch() : detailQuery.refetch())}
       />
 
       <Text style={styles.label}>
