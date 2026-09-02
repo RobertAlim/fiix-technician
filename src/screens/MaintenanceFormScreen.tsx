@@ -439,6 +439,7 @@ export function MaintenanceFormScreen() {
       // times a report gets retried it can only ever land once server-side.
       await enqueueReport({
         id,
+        kind: "maintenance",
         createdAt: new Date().toISOString(),
         payload: JSON.stringify(payload),
         photoLocalUris: JSON.stringify([nozzlePhotoUri]),

@@ -132,6 +132,18 @@ export function RootNavigator() {
     // re-checks immediately rather than waiting out the rest of the
     // interval.
     refetchInterval: VERSION_CHECK_INTERVAL_MS,
+    // Overrides the app-wide default (retry: 1, set in App.tsx) with
+    // more attempts and real backoff between them — this is the ONE
+    // query in the entire app whose failure can fully block access
+    // before a technician even reaches sign-in, so it should tolerate a
+    // flaky mobile connection (a single dropped packet, a momentary
+    // handoff between cell towers) rather than giving up after one retry
+    // fired near-instantly. 3 retries with 1s/2s/4s backoff costs at
+    // most ~7 extra seconds on a genuinely bad connection, which is
+    // cheap insurance against showing a block screen for a problem that
+    // would have resolved itself on the next attempt.
+    retry: 3,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
   });
 
   // Declared here, BEFORE any conditional return below — React's hook
@@ -172,6 +184,24 @@ export function RootNavigator() {
     // narrow window (effectively "first-ever launch with no
     // connectivity"), since Clerk sign-in itself needs a network
     // connection the technician doesn't have here either.
+    //
+    // Shows the real failure underneath the generic message — an
+    // ApiError means the request reached the server and got back a
+    // non-2xx status (shown as the status code + URL); any other Error
+    // means the request never got a response at all (DNS, timeout,
+    // no connectivity, TLS failure, etc — shown as that error's own
+    // message, e.g. "Network request failed" or "Request timed out").
+    // This is the same information adb logcat / Console.app would show
+    // for this request's `[api] ...` log line, surfaced directly on the
+    // screen instead, so diagnosing this doesn't require pulling device
+    // logs at all.
+    const err = versionQuery.error;
+    const detail =
+      err instanceof ApiError
+        ? `HTTP ${err.status} — ${err.url}`
+        : err instanceof Error
+        ? err.message
+        : null;
     return (
       <Centered>
         <View style={{ padding: 24, gap: 16, alignItems: "center" }}>
@@ -182,6 +212,20 @@ export function RootNavigator() {
             This device hasn't verified it's running an approved build yet. Connect to the
             internet and try again.
           </Text>
+          {detail && (
+            <Text
+              style={{
+                color: theme.mutedForeground,
+                fontFamily: "monospace",
+                fontSize: 12,
+                textAlign: "center",
+                opacity: 0.7,
+                paddingHorizontal: 8,
+              }}
+            >
+              {detail}
+            </Text>
+          )}
           <Pressable
             style={{
               borderWidth: 1,
