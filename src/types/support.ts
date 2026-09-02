@@ -35,6 +35,13 @@ export interface SupportServiceRow {
   location: string;
   supportServiceTypeId: number;
   supportServiceType: string;
+  /** Visit order within the technician's day, set by the Scheduler's
+   *  "Save Order" action on the web app (same field/purpose as
+   *  ScheduleRow.sequence) — null if never sequenced. This is what lets
+   *  the Dashboard interleave Support Services into the SAME ordered
+   *  list as printer stops instead of always appending them at the end
+   *  regardless of the Scheduler's actual saved order. */
+  sequence: number | null;
   /** Written by the Scheduler when assigning the activity — read-only to
    *  the technician (mirrors how schedules.notes works on the printer
    *  side). */

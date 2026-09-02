@@ -17,7 +17,7 @@
 // but the app should surface a clear timeout/error instead of hanging
 // silently regardless of the cause, which is what this version does.
 import React, { useEffect, useRef, useState } from "react";
-import { View, Text, Pressable, StyleSheet, FlatList, ActivityIndicator, Alert, ScrollView, Linking, Modal, TextInput } from "react-native";
+import { View, Text, Pressable, StyleSheet, ActivityIndicator, Alert, ScrollView, Linking, Modal, TextInput } from "react-native";
 import * as Location from "expo-location";
 import { Feather } from "@expo/vector-icons";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -113,6 +113,13 @@ interface ScheduleRow {
   client: { name: string };
   location: { name: string };
   scheduleDetails: ScheduleDetailRow[];
+  // Visit order within the technician's day, set by the Scheduler's
+  // "Save Order" action — same field GET /api/schedule's OTHER (Schedule
+  // page) branch already used for the drag-reorder grid. Needed here now
+  // that Technical and Support Services render as ONE combined,
+  // sequence-ordered list (see combinedItinerary below) instead of two
+  // separate always-Technical-first sections.
+  sequence: number | null;
   // NEW — see the backend spec accompanying this delta. Read directly
   // off THIS row rather than cross-referenced from a different endpoint
   // (which is what the old `itineraryCoords`/`coordsForSchedule` join
@@ -135,6 +142,14 @@ interface ScheduleRow {
   // asserted non-null.
   supportServiceCompletion: { id: number; status: SupportServiceStatus | null } | null;
 }
+
+// One entry in the unified daily itinerary — see combinedItinerary
+// below. `sequence` is duplicated up to this level (rather than read
+// off `data` at sort time) purely so the sort comparator doesn't need
+// to branch on `kind` to find it.
+type CombinedItineraryItem =
+  | { kind: "schedule"; sequence: number | null; key: string; data: ScheduleRow }
+  | { kind: "support"; sequence: number | null; key: string; data: SupportServiceRow };
 
 /** "yyyy-MM-dd" in Asia/Manila regardless of the device's own timezone —
  *  the server compares scheduledAt by exact string equality, so this has
@@ -305,34 +320,40 @@ export function DashboardScreen() {
     });
   }, [offlineSync.online, scheduleQuery.data, supportQuery.data, queryClient, api]);
 
-  // Technical vs. Support Services classification — automatic, based
-  // purely on whether a schedule actually has any printer assigned to
-  // it (scheduleDetails.length), NOT on which endpoint/table it came
-  // from. This matters because a `schedules` row with zero
-  // scheduleDetails is a real, valid shape (a Scheduler can create an
-  // itinerary stop with a client/location/notes and never attach a
-  // printer to it) — and until now, EVERY row from GET /api/schedule
-  // rendered under "Technical Services" regardless, which is exactly
-  // the misclassification reported: a client visit with no printer
-  // showing up under the printer-itinerary header, with nothing
-  // beneath it once rendered (its scheduleDetails.map produced zero
-  // rows), looking like an empty/broken entry rather than what it
-  // actually was.
+  // The unified daily itinerary — Technical Services (schedules WITH
+  // printers) and Support Services (both printer-less schedules AND
+  // genuine `supportServices` rows) interleaved into ONE list, ordered
+  // by the Scheduler's saved `sequence`. This replaces the previous
+  // design of two separate sections (all printer stops, then ALL
+  // Support Services appended after them regardless of sequence) — that
+  // design is exactly what caused Support Services to be wrongly treated
+  // as the technician's final stop no matter what the Scheduler actually
+  // saved.
   //
-  // This is independent of — and in addition to — the dedicated
-  // `supportServices` table (supportQuery below): a schedule with no
-  // printer is reclassified for DISPLAY purposes even though it isn't
-  // literally a `supportServices` row, because from the technician's
-  // point of view "no printer to maintain here" belongs under Support
-  // Services either way.
-  const printerSchedules = React.useMemo(
-    () => (scheduleQuery.data ?? []).filter((s) => s.scheduleDetails.length > 0),
-    [scheduleQuery.data]
-  );
-  const noPrinterSchedules = React.useMemo(
-    () => (scheduleQuery.data ?? []).filter((s) => s.scheduleDetails.length === 0),
-    [scheduleQuery.data]
-  );
+  // Sort rule: both sequence values present → compare directly. Only one
+  // present → the sequenced one sorts first (an unsequenced item has no
+  // claim to a position, so it falls to the end rather than displacing a
+  // deliberately-ordered one). Neither present → stable relative order
+  // (Array.prototype.sort is stable in every JS engine this app targets),
+  // so two unsequenced items keep whatever order they arrived in from
+  // their respective queries rather than jumping around between renders.
+  const combinedItinerary = React.useMemo(() => {
+    const items: CombinedItineraryItem[] = [
+      ...(scheduleQuery.data ?? []).map(
+        (s): CombinedItineraryItem => ({ kind: "schedule", sequence: s.sequence, key: `sched-${s.id}`, data: s })
+      ),
+      ...(supportQuery.data ?? []).map(
+        (r): CombinedItineraryItem => ({ kind: "support", sequence: r.sequence, key: `support-${r.id}`, data: r })
+      ),
+    ];
+    items.sort((a, b) => {
+      if (a.sequence != null && b.sequence != null) return a.sequence - b.sequence;
+      if (a.sequence != null) return -1;
+      if (b.sequence != null) return 1;
+      return 0;
+    });
+    return items;
+  }, [scheduleQuery.data, supportQuery.data]);
 
   // supportServices ids with a submission already sitting in the local
   // offline queue. Exactly the same "don't let them file it twice"
@@ -427,170 +448,259 @@ export function DashboardScreen() {
     });
   };
 
-  /** The Support Services half of the itinerary. Rendered as the printer
-   *  FlatList's footer while on duty, and again (read-only) in the Shift
-   *  Complete summary, so a technician's day is accounted for in both
-   *  places rather than support work quietly vanishing from the
-   *  end-of-shift picture. */
-  const SupportServicesSection = ({ readOnly = false }: { readOnly?: boolean }) => {
-    const rows = supportQuery.data ?? [];
-    const totalCount = rows.length + noPrinterSchedules.length;
+  /** A small, visually prominent circular badge showing this item's
+   *  position in the unified itinerary — the "1 → First Task, 2 →
+   *  Second Task" numbering the request asked for. Position is the
+   *  item's actual rendered order (1-indexed), which already reflects
+   *  the Scheduler's saved sequence via combinedItinerary's sort — this
+   *  badge doesn't re-derive anything, it just displays where each card
+   *  landed. */
+  const NumberBadge = ({ position }: { position: number }) => (
+    <View style={styles.numberBadge}>
+      <Text style={styles.numberBadgeText}>{position}</Text>
+    </View>
+  );
+
+  /** Renders ONE combined-itinerary card, branching on its kind — this
+   *  is the single implementation both the on-duty view and the
+   *  read-only Shift Complete summary call, so the two can never drift
+   *  out of sync with each other the way two independently-maintained
+   *  render paths eventually would. */
+  const renderItineraryCard = (item: CombinedItineraryItem, position: number, readOnly: boolean) => {
+    if (item.kind === "schedule" && item.data.scheduleDetails.length > 0) {
+      const schedule = item.data;
+      return (
+        <View key={item.key} style={styles.itineraryCardWrap}>
+          <NumberBadge position={position} />
+          <View style={styles.technicalCard}>
+            {/* Client header row — carries the navigate icon, so EVERY
+                client in the itinerary has one, on duty or read-only.
+                Coordinates come straight off this row
+                (schedule.latitude/longitude), not a cross-endpoint
+                lookup — see the ScheduleRow type comment for why. */}
+            <View style={styles.clientHeaderRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.stopClient}>{schedule.client.name}</Text>
+                <Text style={styles.stopLocation}>{schedule.location.name}</Text>
+              </View>
+              {!readOnly && (
+                <NavButton
+                  navKey={`sched-${schedule.id}`}
+                  latitude={schedule.latitude}
+                  longitude={schedule.longitude}
+                />
+              )}
+            </View>
+            <View style={{ gap: 8, marginTop: 8 }}>
+              {schedule.scheduleDetails.map((detail) => {
+                const isQueued = locallyQueuedSchedDetailIds.has(detail.id);
+                const isLocked = detail.isMaintained || isQueued;
+                return (
+                  <Pressable
+                    key={detail.id}
+                    style={[styles.printerRow, isLocked && styles.printerRowDone]}
+                    onPress={readOnly ? undefined : () => openMaintenance(detail)}
+                    disabled={readOnly}
+                  >
+                    <View style={styles.printerIconWrap}>
+                      <Feather
+                        name={detail.isMaintained ? "check-circle" : isQueued ? "clock" : "printer"}
+                        size={16}
+                        color={
+                          detail.isMaintained ? theme.success : isQueued ? theme.warning : theme.primary
+                        }
+                      />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.printerModel}>{detail.printer.model.name ?? "Printer"}</Text>
+                      <Text style={styles.printerSerial}>{detail.printer.serialNo}</Text>
+                    </View>
+                    {detail.isMaintained ? (
+                      <View style={[styles.statusBadge, styles.statusBadgeDone]}>
+                        <Text style={[styles.statusBadgeText, { color: theme.success }]}>Maintained</Text>
+                      </View>
+                    ) : isQueued ? (
+                      <View style={[styles.statusBadge, styles.statusBadgeQueued]}>
+                        <Text style={[styles.statusBadgeText, { color: theme.warning }]}>Pending Sync</Text>
+                      </View>
+                    ) : !readOnly ? (
+                      <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
+                    ) : (
+                      <View style={[styles.statusBadge, { backgroundColor: `${theme.destructive}26` }]}>
+                        <Text style={[styles.statusBadgeText, { color: theme.destructive }]}>Missed</Text>
+                      </View>
+                    )}
+                    {/* History icon — its own hit target (a nested
+                        Pressable wins the touch over its parent in RN),
+                        so tapping history never accidentally opens the
+                        maintenance form, and stays available even when
+                        the row itself is locked/read-only. */}
+                    <Pressable
+                      style={styles.historyButton}
+                      hitSlop={8}
+                      onPress={() =>
+                        navigation.navigate("PrinterHistory", { serialNo: detail.printer.serialNo })
+                      }
+                    >
+                      <Feather name="clock" size={16} color={theme.info} />
+                    </Pressable>
+                  </Pressable>
+                );
+              })}
+            </View>
+          </View>
+        </View>
+      );
+    }
+
+    if (item.kind === "schedule") {
+      // Printer-less schedule — the "documented as a Support Service"
+      // case (see openSupportServiceFromSchedule).
+      const schedule = item.data;
+      const isQueued = locallyQueuedScheduleIds.has(schedule.id);
+      const completion = schedule.supportServiceCompletion;
+      const effectiveStatus = completion?.status ?? (isQueued ? "Pending Sync" : null);
+      const statusColor =
+        effectiveStatus === "Achieved"
+          ? theme.success
+          : effectiveStatus === "Not Achieved"
+          ? theme.destructive
+          : effectiveStatus === "Pending Sync"
+          ? theme.warning
+          : theme.mutedForeground;
+      const locked = completion != null || isQueued;
+      return (
+        <View key={item.key} style={styles.itineraryCardWrap}>
+          <NumberBadge position={position} />
+          <Pressable
+            style={[styles.supportCard, locked && styles.printerRowDone]}
+            onPress={readOnly ? undefined : () => openSupportServiceFromSchedule(schedule)}
+            disabled={readOnly}
+          >
+            <View style={styles.supportIconWrap}>
+              <Feather name="clipboard" size={16} color={theme.info} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.stopClient}>{schedule.client.name}</Text>
+              <Text style={styles.stopLocation}>{schedule.location.name}</Text>
+              <View style={styles.supportTypeRow}>
+                <Text style={[styles.supportTypeTag, styles.noPrinterTag]}>No printer assigned</Text>
+              </View>
+              {schedule.notes ? <Text style={styles.notes}>{schedule.notes}</Text> : null}
+            </View>
+            <View style={{ alignItems: "flex-end", gap: 6 }}>
+              {effectiveStatus ? (
+                <View style={[styles.statusBadge, { backgroundColor: `${statusColor}26` }]}>
+                  <Text style={[styles.statusBadgeText, { color: statusColor }]}>{effectiveStatus}</Text>
+                </View>
+              ) : readOnly ? (
+                <View style={[styles.statusBadge, { backgroundColor: `${theme.destructive}26` }]}>
+                  <Text style={[styles.statusBadgeText, { color: theme.destructive }]}>Missed</Text>
+                </View>
+              ) : (
+                <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
+              )}
+              {!readOnly && (
+                <NavButton navKey={`sched-${schedule.id}`} latitude={schedule.latitude} longitude={schedule.longitude} />
+              )}
+            </View>
+          </Pressable>
+        </View>
+      );
+    }
+
+    // item.kind === "support" — a genuine Scheduler-created Support
+    // Service (scheduleId IS NULL server-side; a completed printer-less
+    // schedule's OWN row is filtered out of supportQuery — see
+    // GET /api/support-services' isNull(scheduleId) filter — so this
+    // branch never double-renders what the "schedule" branch above
+    // already covers).
+    const row = item.data;
+    const isQueued = locallyQueuedSupportIds.has(row.id);
+    const effectiveStatus = row.status ?? (isQueued ? "Pending Sync" : null);
+    const statusColor =
+      effectiveStatus === "Achieved"
+        ? theme.success
+        : effectiveStatus === "Not Achieved"
+        ? theme.destructive
+        : effectiveStatus === "Pending Sync"
+        ? theme.warning
+        : theme.mutedForeground;
+    const locked = row.status != null || isQueued;
     return (
-      <View style={{ marginTop: 8 }}>
-        <Text style={styles.sectionTitle}>Support Services</Text>
-        {supportQuery.isLoading ? (
-          <ActivityIndicator color={theme.primary} />
-        ) : supportQuery.isError ? (
-          <View>
-            <Text style={styles.error}>
-              {offlineSync.online
-                ? "Couldn't load today's support services."
-                : "You're offline and support services haven't been downloaded to this device yet."}
-            </Text>
-            {queryErrorDetail(supportQuery.error, !offlineSync.online) && (
-              <Text style={styles.errorDetail}>
-                {queryErrorDetail(supportQuery.error, !offlineSync.online)}
-              </Text>
+      <View key={item.key} style={styles.itineraryCardWrap}>
+        <NumberBadge position={position} />
+        <Pressable
+          style={[styles.supportCard, locked && styles.printerRowDone]}
+          onPress={readOnly ? undefined : () => openSupportService(row)}
+          disabled={readOnly}
+        >
+          <View style={styles.supportIconWrap}>
+            <Feather name="clipboard" size={16} color={theme.info} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.stopClient}>{row.client}</Text>
+            <Text style={styles.stopLocation}>{row.location}</Text>
+            <View style={styles.supportTypeRow}>
+              <Text style={styles.supportTypeTag}>{row.supportServiceType}</Text>
+            </View>
+            {row.notes ? <Text style={styles.notes}>{row.notes}</Text> : null}
+          </View>
+          <View style={{ alignItems: "flex-end", gap: 6 }}>
+            {effectiveStatus ? (
+              <View style={[styles.statusBadge, { backgroundColor: `${statusColor}26` }]}>
+                <Text style={[styles.statusBadgeText, { color: statusColor }]}>{effectiveStatus}</Text>
+              </View>
+            ) : readOnly ? (
+              <View style={[styles.statusBadge, { backgroundColor: `${theme.destructive}26` }]}>
+                <Text style={[styles.statusBadgeText, { color: theme.destructive }]}>Missed</Text>
+              </View>
+            ) : (
+              <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
+            )}
+            {!readOnly && (
+              <NavButton navKey={`support-${row.id}`} latitude={row.latitude} longitude={row.longitude} />
             )}
           </View>
-        ) : totalCount === 0 ? (
-          <Text style={styles.subtitle}>No support services scheduled today.</Text>
-        ) : (
-          <View style={{ gap: 10 }}>
-            {rows.map((row) => {
-              const isQueued = locallyQueuedSupportIds.has(row.id);
-              const effectiveStatus = row.status ?? (isQueued ? "Pending Sync" : null);
-              const statusColor =
-                effectiveStatus === "Achieved"
-                  ? theme.success
-                  : effectiveStatus === "Not Achieved"
-                  ? theme.destructive
-                  : effectiveStatus === "Pending Sync"
-                  ? theme.warning
-                  : theme.mutedForeground;
-              const locked = row.status != null || isQueued;
-              return (
-                <Pressable
-                  key={`support-${row.id}`}
-                  style={[styles.supportCard, locked && styles.printerRowDone]}
-                  onPress={readOnly ? undefined : () => openSupportService(row)}
-                  disabled={readOnly}
-                >
-                  <View style={styles.supportIconWrap}>
-                    <Feather name="clipboard" size={16} color={theme.info} />
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.stopClient}>{row.client}</Text>
-                    <Text style={styles.stopLocation}>{row.location}</Text>
-                    <View style={styles.supportTypeRow}>
-                      <Text style={styles.supportTypeTag}>{row.supportServiceType}</Text>
-                    </View>
-                    {row.notes ? <Text style={styles.notes}>{row.notes}</Text> : null}
-                  </View>
-                  <View style={{ alignItems: "flex-end", gap: 6 }}>
-                    {effectiveStatus ? (
-                      <View style={[styles.statusBadge, { backgroundColor: `${statusColor}26` }]}>
-                        <Text style={[styles.statusBadgeText, { color: statusColor }]}>
-                          {effectiveStatus}
-                        </Text>
-                      </View>
-                    ) : readOnly ? (
-                      <View style={[styles.statusBadge, { backgroundColor: `${theme.destructive}26` }]}>
-                        <Text style={[styles.statusBadgeText, { color: theme.destructive }]}>
-                          Missed
-                        </Text>
-                      </View>
-                    ) : (
-                      <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
-                    )}
-                    {!readOnly && (
-                      <NavButton
-                        navKey={`support-${row.id}`}
-                        latitude={row.latitude}
-                        longitude={row.longitude}
-                      />
-                    )}
-                  </View>
-                </Pressable>
-              );
-            })}
-
-            {/* Reclassified schedules — real `schedules` rows with no
-                printer attached, automatically routed here instead of
-                Technical Services (see printerSchedules/noPrinterSchedules
-                above). Now fully functional: tapping one opens the same
-                Support Services form a Scheduler-created row uses (photo,
-                signature, signatory, type selection), sourced from this
-                schedule's own client/location/notes instead of a
-                supportServices row that doesn't exist until the
-                technician documents it — see
-                openSupportServiceFromSchedule and
-                SupportServiceFormScreen's `scheduleId` param handling. */}
-            {noPrinterSchedules.map((schedule) => {
-              const isQueued = locallyQueuedScheduleIds.has(schedule.id);
-              const completion = schedule.supportServiceCompletion;
-              const effectiveStatus = completion?.status ?? (isQueued ? "Pending Sync" : null);
-              const statusColor =
-                effectiveStatus === "Achieved"
-                  ? theme.success
-                  : effectiveStatus === "Not Achieved"
-                  ? theme.destructive
-                  : effectiveStatus === "Pending Sync"
-                  ? theme.warning
-                  : theme.mutedForeground;
-              const locked = completion != null || isQueued;
-              return (
-                <Pressable
-                  key={`sched-${schedule.id}`}
-                  style={[styles.supportCard, locked && styles.printerRowDone]}
-                  onPress={readOnly ? undefined : () => openSupportServiceFromSchedule(schedule)}
-                  disabled={readOnly}
-                >
-                  <View style={styles.supportIconWrap}>
-                    <Feather name="clipboard" size={16} color={theme.info} />
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.stopClient}>{schedule.client.name}</Text>
-                    <Text style={styles.stopLocation}>{schedule.location.name}</Text>
-                    <View style={styles.supportTypeRow}>
-                      <Text style={[styles.supportTypeTag, styles.noPrinterTag]}>
-                        No printer assigned
-                      </Text>
-                    </View>
-                    {schedule.notes ? <Text style={styles.notes}>{schedule.notes}</Text> : null}
-                  </View>
-                  <View style={{ alignItems: "flex-end", gap: 6 }}>
-                    {effectiveStatus ? (
-                      <View style={[styles.statusBadge, { backgroundColor: `${statusColor}26` }]}>
-                        <Text style={[styles.statusBadgeText, { color: statusColor }]}>
-                          {effectiveStatus}
-                        </Text>
-                      </View>
-                    ) : readOnly ? (
-                      <View style={[styles.statusBadge, { backgroundColor: `${theme.destructive}26` }]}>
-                        <Text style={[styles.statusBadgeText, { color: theme.destructive }]}>
-                          Missed
-                        </Text>
-                      </View>
-                    ) : (
-                      <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
-                    )}
-                    {!readOnly && (
-                      <NavButton
-                        navKey={`sched-${schedule.id}`}
-                        latitude={schedule.latitude}
-                        longitude={schedule.longitude}
-                      />
-                    )}
-                  </View>
-                </Pressable>
-              );
-            })}
-          </View>
-        )}
+        </Pressable>
       </View>
     );
   };
+
+  /** The unified itinerary list — replaces the old two-section design
+   *  (a printer FlatList with Support Services always appended as its
+   *  footer). Combines BOTH queries' loading/error states, since a
+   *  technician needs to know if EITHER half of today's work failed to
+   *  load, not just the printer half. */
+  const CombinedItineraryList = ({ readOnly = false }: { readOnly?: boolean }) => {
+    if (scheduleQuery.isLoading || supportQuery.isLoading) {
+      return <ActivityIndicator color={theme.primary} />;
+    }
+    if (scheduleQuery.isError || supportQuery.isError) {
+      const err = scheduleQuery.error ?? supportQuery.error;
+      return (
+        <View>
+          <Text style={styles.error}>
+            {offlineSync.online
+              ? "Couldn't load today's itinerary."
+              : "You're offline and today's itinerary hasn't been downloaded to this device yet."}
+          </Text>
+          {queryErrorDetail(err, !offlineSync.online) && (
+            <Text style={styles.errorDetail}>{queryErrorDetail(err, !offlineSync.online)}</Text>
+          )}
+        </View>
+      );
+    }
+    if (combinedItinerary.length === 0) {
+      return <Text style={styles.subtitle}>No visits scheduled today.</Text>;
+    }
+    return (
+      <View style={{ gap: 16 }}>
+        {combinedItinerary.map((item, i) => renderItineraryCard(item, i + 1, readOnly))}
+      </View>
+    );
+  };
+
 
   const openMaintenance = (detail: ScheduleDetailRow) => {
     if (detail.isMaintained) {
@@ -1040,78 +1150,18 @@ export function DashboardScreen() {
           </View>
         )}
 
-        <Text style={styles.sectionTitle}>Technical Services · Printer Itinerary</Text>
-        {scheduleQuery.isLoading ? (
-          <ActivityIndicator color={theme.primary} />
-        ) : scheduleQuery.isError ? (
-          <View>
-            <Text style={styles.error}>
-              {offlineSync.online
-                ? "Couldn't load today's summary."
-                : "You're offline and today's summary hasn't been downloaded to this device yet."}
-            </Text>
-            {queryErrorDetail(scheduleQuery.error, !offlineSync.online) && (
-              <Text style={styles.errorDetail}>
-                {queryErrorDetail(scheduleQuery.error, !offlineSync.online)}
-              </Text>
-            )}
-          </View>
-        ) : allDetails.length === 0 ? (
-          <Text style={styles.subtitle}>No printer maintenance was scheduled today.</Text>
-        ) : (
-          printerSchedules.map((schedule) => (
-            <View key={schedule.id} style={{ marginBottom: 16 }}>
-              <Text style={styles.stopClient}>{schedule.client.name}</Text>
-              <Text style={styles.stopLocation}>{schedule.location.name}</Text>
-              <View style={{ gap: 8, marginTop: 8 }}>
-                {schedule.scheduleDetails.map((detail) => {
-                  // A report saved but not yet synced still represents
-                  // completed work, not a miss — see saveMaintenance()'s
-                  // online-first logic, which can leave a report queued
-                  // for a short window on a bad connection even though
-                  // the technician genuinely finished the job.
-                  const isQueued = locallyQueuedSchedDetailIds.has(detail.id);
-                  const status: "Maintained" | "Pending Sync" | "Missed" = detail.isMaintained
-                    ? "Maintained"
-                    : isQueued
-                    ? "Pending Sync"
-                    : "Missed";
-                  const statusColor =
-                    status === "Maintained"
-                      ? theme.success
-                      : status === "Pending Sync"
-                      ? theme.warning
-                      : theme.destructive;
-                  const statusIcon =
-                    status === "Maintained" ? "check-circle" : status === "Pending Sync" ? "clock" : "x-circle";
-                  return (
-                    <View key={detail.id} style={[styles.printerRow, styles.printerRowDone]}>
-                      <View style={styles.printerIconWrap}>
-                        <Feather name="printer" size={16} color={theme.mutedForeground} />
-                      </View>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.printerModel}>{detail.printer.model.name ?? "Printer"}</Text>
-                        <Text style={styles.printerSerial}>{detail.printer.serialNo}</Text>
-                      </View>
-                      <View style={[styles.statusBadge, { backgroundColor: `${statusColor}26` }]}>
-                        <Feather name={statusIcon} size={11} color={statusColor} />
-                        <Text style={[styles.statusBadgeText, { color: statusColor, marginLeft: 4 }]}>
-                          {status}
-                        </Text>
-                      </View>
-                    </View>
-                  );
-                })}
-              </View>
-            </View>
-          ))
-        )}
-
-        {/* Support work counts as the technician's day too — leaving it
-            out of the end-of-shift summary would make an errand-only day
-            look empty. Read-only here: the shift is over, so nothing in
-            this branch is actionable. */}
-        <SupportServicesSection readOnly />
+        <Text style={styles.sectionTitle}>Today's Itinerary</Text>
+        {/* Same unified renderer the on-duty view uses (see
+            CombinedItineraryList/renderItineraryCard above) — reused here
+            rather than a second, separately-maintained summary layout, so
+            the numbered order a technician sees while working matches
+            exactly what they see reviewing their completed day, and
+            Support Services no longer needs its own separate summary
+            block appended after (see the note below, previously
+            SupportServicesSection). readOnly suppresses tap targets and
+            the nav icon; everything else — numbering, status pills,
+            history icon — stays. */}
+        <CombinedItineraryList readOnly />
       </ScrollView>
     );
   }
@@ -1259,128 +1309,22 @@ export function DashboardScreen() {
         </View>
         {syncing && <Text style={styles.syncing}>Syncing offline reports…</Text>}
       </View>
-      {/* Technical vs Support Services split. These are two genuinely
-          different kinds of assigned work — one is printer maintenance
-          against a printer itinerary, the other is a client errand with
-          no printer involved at all — and the request was explicit that
-          they stay distinct rather than being merged into one "today"
-          list. Rendered as one FlatList (printer stops) with the support
-          section as its footer, so the whole screen scrolls as a single
-          surface and the Time Out button stays pinned below both. */}
-      {scheduleQuery.isLoading ? (
-        <ActivityIndicator color={theme.primary} />
-      ) : scheduleQuery.isError ? (
-        <View>
-          <Text style={styles.error}>
-            {offlineSync.online
-              ? "Couldn't load today's printers."
-              : "You're offline and today's printers haven't been downloaded to this device yet."}
-          </Text>
-          {queryErrorDetail(scheduleQuery.error, !offlineSync.online) && (
-            <Text style={styles.errorDetail}>
-              {queryErrorDetail(scheduleQuery.error, !offlineSync.online)}
-            </Text>
-          )}
-        </View>
-      ) : (
-        <FlatList
-          data={printerSchedules}
-          keyExtractor={(s) => String(s.id)}
-          contentContainerStyle={{ gap: 16, paddingBottom: 8 }}
-          ListHeaderComponent={
-            <Text style={styles.sectionTitle}>Technical Services · Printer Itinerary</Text>
-          }
-          ListEmptyComponent={
-            <Text style={styles.subtitle}>No printer maintenance scheduled today.</Text>
-          }
-          ListFooterComponent={<SupportServicesSection />}
-          renderItem={({ item: schedule }) => {
-            return (
-              <View>
-                {/* Client header row — now carries the navigate icon, so
-                    EVERY client in the itinerary has one on duty, not
-                    just in the pre-Time-In preview. Coordinates come
-                    straight off this same row (schedule.latitude/
-                    longitude) rather than a cross-endpoint lookup — see
-                    the ScheduleRow type comment for why that changed. */}
-                <View style={styles.clientHeaderRow}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.stopClient}>{schedule.client.name}</Text>
-                    <Text style={styles.stopLocation}>{schedule.location.name}</Text>
-                  </View>
-                  <NavButton
-                    navKey={`sched-${schedule.id}`}
-                    latitude={schedule.latitude}
-                    longitude={schedule.longitude}
-                  />
-                </View>
-                <View style={{ gap: 8, marginTop: 8 }}>
-                  {schedule.scheduleDetails.map((detail) => {
-                    const isQueued = locallyQueuedSchedDetailIds.has(detail.id);
-                    const isLocked = detail.isMaintained || isQueued;
-                    return (
-                      <Pressable
-                        key={detail.id}
-                        style={[styles.printerRow, isLocked && styles.printerRowDone]}
-                        onPress={() => openMaintenance(detail)}
-                      >
-                        <View style={styles.printerIconWrap}>
-                          <Feather
-                            name={detail.isMaintained ? "check-circle" : isQueued ? "clock" : "printer"}
-                            size={16}
-                            color={
-                              detail.isMaintained
-                                ? theme.success
-                                : isQueued
-                                ? theme.warning
-                                : theme.primary
-                            }
-                          />
-                        </View>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.printerModel}>{detail.printer.model.name ?? "Printer"}</Text>
-                          <Text style={styles.printerSerial}>{detail.printer.serialNo}</Text>
-                        </View>
-                        {detail.isMaintained ? (
-                          <View style={[styles.statusBadge, styles.statusBadgeDone]}>
-                            <Text style={[styles.statusBadgeText, { color: theme.success }]}>Maintained</Text>
-                          </View>
-                        ) : isQueued ? (
-                          <View style={[styles.statusBadge, styles.statusBadgeQueued]}>
-                            <Text style={[styles.statusBadgeText, { color: theme.warning }]}>Pending Sync</Text>
-                          </View>
-                        ) : (
-                          <Feather name="chevron-right" size={18} color={theme.mutedForeground} />
-                        )}
-                        {/* History icon. Its own hit target with
-                            stopPropagation-equivalent behaviour (a nested
-                            Pressable wins the touch over its parent in
-                            RN), so tapping history never accidentally
-                            opens the maintenance form — and it stays
-                            available on ALREADY-MAINTAINED rows too,
-                            where the row itself is locked. That's the
-                            case it's arguably most useful in: checking
-                            what was done here before. */}
-                        <Pressable
-                          style={styles.historyButton}
-                          hitSlop={8}
-                          onPress={() =>
-                            navigation.navigate("PrinterHistory", {
-                              serialNo: detail.printer.serialNo,
-                            })
-                          }
-                        >
-                          <Feather name="clock" size={16} color={theme.info} />
-                        </Pressable>
-                      </Pressable>
-                    );
-                  })}
-                </View>
-              </View>
-            );
-          }}
-        />
-      )}
+      {/* Unified daily itinerary — Technical Services and Support
+          Services interleaved into ONE list, ordered by the Scheduler's
+          saved sequence (see combinedItinerary above). Previously this
+          was two separate sections (all printer stops, THEN all Support
+          Services appended after regardless of sequence) — that's
+          exactly what caused Support Services to be wrongly treated as
+          the technician's final stop no matter what was actually saved.
+          Wrapped in a ScrollView (not FlatList) since the list now mixes
+          two structurally different card shapes rather than one uniform
+          item type, and today's itinerary is small enough (rarely more
+          than a handful of stops) that FlatList's virtualization isn't
+          buying anything here. */}
+      <ScrollView style={{ flex: 1 }} contentContainerStyle={{ gap: 16, paddingBottom: 8 }}>
+        <Text style={styles.sectionTitle}>Today's Itinerary</Text>
+        <CombinedItineraryList />
+      </ScrollView>
       {/* Time Out geofence gate. lastGeofence coming back null (no
           geofence configured on the last stop) is treated as "can't
           verify, so don't allow it" rather than silently letting Time
@@ -1623,6 +1567,43 @@ function createStyles(theme: Palette) {
     },
     printerRowDone: { opacity: 0.6 },
     clientHeaderRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+    // Wraps ONE combined-itinerary card + its number badge. The badge is
+    // absolutely positioned so it visually overlaps the card's top-left
+    // corner — deliberately prominent (the request specifically asked
+    // for the numbering to be "visually prominent and easy to identify")
+    // rather than a small inline label that could get lost among the
+    // status pill and icons already on each card.
+    itineraryCardWrap: { position: "relative" },
+    numberBadge: {
+      position: "absolute",
+      top: -10,
+      left: -6,
+      zIndex: 10,
+      minWidth: 26,
+      height: 26,
+      borderRadius: 13,
+      paddingHorizontal: 6,
+      alignItems: "center",
+      justifyContent: "center",
+      backgroundColor: theme.primary,
+      borderWidth: 2,
+      borderColor: theme.background,
+    },
+    numberBadgeText: { color: theme.primaryForeground, fontSize: 13, fontWeight: "800" },
+    // Card chrome for a printer-stop item — previously this content sat
+    // directly on the screen background with no card treatment (fine
+    // when it was the only shape in a plain FlatList), but now that it's
+    // interleaved with Support Services' own bordered cards in one list,
+    // giving it the same background/border/radius/padding keeps every
+    // itinerary item visually consistent, and gives the number badge a
+    // corner to sit on top of instead of overlapping bare text.
+    technicalCard: {
+      backgroundColor: theme.card,
+      borderRadius: theme.radius,
+      borderWidth: 1,
+      borderColor: theme.border,
+      padding: 12,
+    },
     historyButton: {
       width: 30,
       height: 30,
